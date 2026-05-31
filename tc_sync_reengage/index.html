@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<!--
+  Timecode Sync + Re-Engage
+  =========================
+  - Monitors a transport's INCOMING timecode vs TIMECODE POSITION + the gap,
+    with a SYNCED / NOT SYNCED status. All via LiveUpdate PUSH (no polling).
+  - Re-Engage button (disengage -> engage) for the chosen transport (REST).
+  - Auto Re-Engage on de-sync (optional).
+  - LiveUpdate command bus (optional, bridge-free, drive from Companion/stream deck):
+      * a device variable that, when changed, fires Re-Engage.
+      * a device variable this plugin WRITES with the sync state (1=synced, 0=not)
+        so a stream-deck button can color itself.
+
+  LiveUpdate reads:
+    incoming  = object.monitorString
+    position  = object.beatToTimecode(object.track.timeToBeat(object.player.tCurrent)).__str__()
+    (object = transportmanager:<name>)
+  Command bus (object = expressionvariablesdevice:<dev>):
+    read cmd  = object.container.variables[<i>].defaultFloat   (fire re-engage on change)
+    write sync= {set} the sync-status variable's id
+-->
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>TC Syncer</title>
+    <meta name="disguise-plugin-window-size" content="360,560">
+    <meta name="disguise-plugin-window-min-size" content="180,110">
+    <meta name="disguise-plugin-window-resizable" content="true">
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 10px; color: #fff; }
+        .container { width: 100%; max-width: 440px; margin: 0 auto; box-sizing: border-box; }
+        button { padding: 8px 14px; font-size: 14px; cursor: pointer; }
+        .btn-row { display: flex; gap: 8px; justify-content: center; margin: 6px 0; flex-wrap: wrap; }
+        #reengage-btn { font-weight: bold; }
+        #status { margin-top: 6px; min-height: 1.1em; white-space: pre-wrap; font-size: 12px; text-align: center; }
+        #status.success { color: #4ade80; } #status.error, #status.warn { color: #ff6b6b; }
+        details.sec { border: 1px solid #444; border-radius: 6px; padding: 6px 10px; margin-top: 8px; }
+        details.sec > summary { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: #aaa; cursor: pointer; }
+        .field { display: flex; flex-direction: column; margin-bottom: 8px; }
+        .field label { font-size: 12px; margin-bottom: 2px; color: #ccc; }
+        .row { display: flex; gap: 6px; align-items: center; }
+        .row .grow { flex: 1; }
+        input, select { font-size: 13px; font-family: monospace; padding: 4px; box-sizing: border-box; }
+        .field input, .field select { width: 100%; }
+        .hint { font-size: 11px; color: #aaa; margin-top: 2px; }
+        .clocks { display: flex; gap: 8px; }
+        .clock { flex: 1; border: 1px solid #444; border-radius: 5px; padding: 8px; text-align: center; }
+        .clock .lab { font-size: 10px; color: #aaa; text-transform: uppercase; letter-spacing: .5px; }
+        .clock .val { font-family: monospace; font-size: 20px; margin-top: 3px; white-space: nowrap; }
+        #rd-incoming .val { color: #7dd3fc; } #rd-position .val { color: #4ade80; }
+        .val.stale { color: #ff6b6b; }
+        #sync { text-align: center; margin-top: 10px; }
+        #sync .light { font-family: monospace; font-weight: bold; font-size: 24px; }
+        #sync .light.synced { color: #4ade80; } #sync .light.notsynced { color: #ff6b6b; }
+        #sync .gap { font-family: monospace; font-size: 12px; color: #aaa; }
+        .chk { font-size: 12px; cursor: pointer; } .chk input { vertical-align: middle; margin-right: 4px; }
+        #lu-conn { font-size: 11px; }
+        details { margin-top: 10px; font-size: 12px; } summary { cursor: pointer; color: #fff; }
+        #log { margin-top: 10px; max-height: 110px; overflow-y: auto; text-align: left; font-family: monospace; font-size: 11px; border: 1px solid #444; border-radius: 4px; padding: 6px; }
+        #log:empty::after { content: "No activity yet."; color: #888; }
+        .le { white-space: pre-wrap; color: #fff; } .le.event { color: #4ade80; } .le.err { color: #ff6b6b; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <!-- Always visible: the sync light + gap. Everything else collapses for show. -->
+    <div id="sync">
+        <div class="light" id="v-sync">—</div>
+        <div class="gap" id="v-gap"></div>
+    </div>
+
+    <details class="sec" id="sec-clocks" open>
+        <summary>Clocks</summary>
+        <div class="clocks">
+            <div class="clock" id="rd-incoming"><div class="lab">Incoming TC</div><div class="val" id="v-incoming">—</div></div>
+            <div class="clock" id="rd-position"><div class="lab">TC position</div><div class="val" id="v-position">—</div></div>
+        </div>
+    </details>
+
+    <details class="sec" id="sec-transport" open>
+        <summary>Transport &amp; control</summary>
+        <div class="field" style="margin-top:8px;">
+            <label for="transport">Transport (monitor + re-engage)</label>
+            <div class="row">
+                <select id="transport" class="grow"></select>
+                <button onclick="loadTransports()" title="Refresh">↻</button>
+            </div>
+        </div>
+        <div class="btn-row">
+            <button id="reengage-btn" onclick="reEngage()">Re-Engage now</button>
+            <button onclick="setEngaged(true)">Engage</button>
+            <button onclick="setEngaged(false)">Disengage</button>
+        </div>
+        <label class="chk" style="display:inline-block;"><input type="checkbox" id="auto-reengage"> Auto Re-Engage on de-sync</label>
+        <div id="status"></div>
+    </details>
+
+    <details class="sec" id="sec-bus">
+        <summary>LiveUpdate command bus</summary>
+        <label class="chk" style="display:inline-block; margin-top:8px;"><input type="checkbox" id="bus-enabled" checked> Enable command bus</label>
+        <div id="lu-conn" class="hint">LiveUpdate: idle</div>
+        <div class="field">
+            <label for="lu-device">ExpressionVariables device (object ref)</label>
+            <input type="text" id="lu-device" spellcheck="false" placeholder="expressionvariablesdevice:vardevice">
+        </div>
+        <div class="field">
+            <label for="lu-reengage-var">Re-engage when this variable changes</label>
+            <input type="text" id="lu-reengage-var" spellcheck="false" placeholder="e.g. reengagecmd">
+        </div>
+        <div class="field">
+            <label for="lu-sync-var">Write sync state (1=synced, 0=not) to this variable</label>
+            <input type="text" id="lu-sync-var" spellcheck="false" placeholder="e.g. syncstatus">
+        </div>
+        <div class="row"><button onclick="applyConfig()">Apply / reconnect</button></div>
+    </details>
+
+    <details class="sec" id="sec-adv">
+        <summary>Advanced</summary>
+        <div class="field" style="margin-top:8px;">
+            <label for="fps">Frame rate (for the gap math)</label>
+            <select id="fps">
+                <option>23.98</option><option>24</option><option>25</option><option>29.97</option>
+                <option selected>30</option><option>48</option><option>50</option><option>59.94</option><option>60</option>
+            </select>
+        </div>
+        <div class="field">
+            <label for="tol">Sync tolerance (± frames)</label>
+            <input type="number" id="tol" min="0" step="1" value="3">
+        </div>
+    </details>
+
+    <details class="sec" id="sec-log">
+        <summary>Log</summary>
+        <div class="row" style="margin:6px 0;"><button onclick="clearLog()">Clear log</button></div>
+        <div id="log"></div>
+    </details>
+</div>
+
+<script>
+    // ---------- plumbing ----------
+    function getDirector() { const p = new URLSearchParams(window.location.search); return p.get('director') || "localhost"; }
+    function base() { const d = getDirector(); return (d.startsWith("http") ? d : "http://" + d); }
+    function setStatus(m, k) { const el = document.getElementById('status'); el.textContent = m || ""; el.className = k || ""; }
+    function log(m, k) {
+        const el = document.getElementById('log'); const d = document.createElement('div');
+        d.className = "le" + (k ? " " + k : ""); d.textContent = new Date().toLocaleTimeString() + "  " + m;
+        el.insertBefore(d, el.firstChild); while (el.childElementCount > 80) el.removeChild(el.lastChild);
+    }
+    function clearLog() { document.getElementById('log').replaceChildren(); }
+    function save(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+    function load(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } }
+    async function runScript(py) {
+        const resp = await fetch(base() + "/api/session/python/execute", { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ script: py }) });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok) throw new Error((data && data.status && data.status.message) || `HTTP ${resp.status}`);
+        const t = data && typeof data.pythonLog === "string" ? data.pythonLog.trim() : "";
+        if (t) { try { return JSON.parse(t); } catch (e) { return t; } }
+        return null;
+    }
+    const PY_EX = "import json\ntry:\n    _ex = Expression\nexcept NameError:\n    import d3\n    _ex = d3.Expression\n";
+
+    function transportName() { return document.getElementById('transport').value; }
+    function fps() { return Math.round(parseFloat(document.getElementById('fps').value)) || 30; }   // 23.98->24, 29.97->30, 59.94->60
+    function tolerance() { const v = parseInt(document.getElementById('tol').value, 10); return isNaN(v) ? 3 : v; }
+    function autoReengage() { return document.getElementById('auto-reengage').checked; }
+    function busEnabled() { return document.getElementById('bus-enabled').checked; }
+
+    // ---------- transport dropdown (REST, one-shot) ----------
+    async function loadTransports() {
+        let list = [];
+        try { const r = await fetch(base() + "/api/session/transport/transports").then(x => x.json()); list = (r && r.transports) || []; }
+        catch (e) { setStatus("Couldn't load transports: " + e.message, "error"); }
+        const sel = document.getElementById('transport');
+        let want = sel.value || load('tcsr-transport', "");
+        sel.replaceChildren();
+        const b = document.createElement('option'); b.value = ""; b.textContent = "— select —"; sel.appendChild(b);
+        list.forEach(t => { const o = document.createElement('option'); o.value = t.name; o.textContent = t.name + (t.engaged ? "" : "  (disengaged)"); sel.appendChild(o); });
+        if (want && [...sel.options].some(o => o.value === want)) sel.value = want;
+    }
+
+    // ---------- re-engage (REST, by uid) ----------
+    async function resolveUid(name) {
+        try {
+            const out = await runScript(PY_EX +
+                "try:\n    _u = int(_ex.evaluateFromString(" + JSON.stringify("transportmanager:" + name + ".uid") + ")) & 0xFFFFFFFFFFFFFFFF\n    print(json.dumps({'uid': str(_u)}))\nexcept BaseException as e:\n    print(json.dumps({'err': str(e)}))");
+            if (out && out.uid) return out.uid;
+        } catch (e) {}
+        return null;
+    }
+    async function setEngaged(engaged) {
+        const name = transportName();
+        if (!name) { setStatus("Pick a transport first.", "error"); return; }
+        setStatus((engaged ? "Engaging" : "Disengaging") + " '" + name + "'...");
+        try {
+            const uid = await resolveUid(name);
+            const tgt = uid ? { uid: uid, name: name } : { name: name };
+            const resp = await fetch(base() + "/api/session/transport/engaged", { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ transports: [{ transport: tgt, engaged: engaged }] }) });
+            const data = await resp.json(); const msg = (data && data.status && data.status.message) || "";
+            if (!resp.ok || /error|fail/i.test(msg)) setStatus("Designer error:\n" + (msg || `HTTP ${resp.status}`), "error");
+            else setStatus("Transport " + (engaged ? "engaged" : "disengaged") + " (" + name + ").", engaged ? "success" : "warn");
+        } catch (e) { setStatus("Request failed: " + e.message, "error"); }
+    }
+    async function reEngage() { await setEngaged(false); await setEngaged(true); }
+
+    // ---------- sync math ----------
+    function parseTC(s, f) {
+        if (!s) return null;
+        const p = String(s).trim().split(/[:.;]/).map(Number);
+        if (p.some(isNaN)) return null;
+        let h = 0, m = 0, sec = 0, fr = 0;
+        if (p.length === 4) [h, m, sec, fr] = p; else if (p.length === 3) [h, m, sec] = p; else return null;
+        return ((h * 60 + m) * 60 + sec) * f + fr;
+    }
+    let lastIncoming = "", lastPosition = "", wasSynced = null, lastAutoReengage = 0;
+    function recomputeSync() {
+        const f = fps();
+        const inc = parseTC(lastIncoming, f), pos = parseTC(lastPosition, f);
+        const lightEl = document.getElementById('v-sync'), gapEl = document.getElementById('v-gap');
+        if (inc === null || pos === null) { lightEl.textContent = "—"; lightEl.className = "light"; gapEl.textContent = ""; return; }
+        const gap = pos - inc;
+        const synced = Math.abs(gap) <= tolerance();
+        lightEl.textContent = synced ? "SYNCED" : "NOT SYNCED";
+        lightEl.className = "light " + (synced ? "synced" : "notsynced");
+        gapEl.textContent = "gap " + (gap >= 0 ? "+" : "") + gap + "f (±" + tolerance() + " ok)";
+        if (synced !== wasSynced) { luWriteSync(synced ? 1 : 0); wasSynced = synced; }   // publish on change
+        // Auto Re-Engage: retry while de-synced (cooldown); re-arm when synced — works repeatedly.
+        if (synced) {
+            lastAutoReengage = 0;
+        } else if (autoReengage() && (Date.now() - lastAutoReengage > 5000)) {
+            lastAutoReengage = Date.now();
+            log("Auto Re-Engage: de-synced (" + (gap >= 0 ? "+" : "") + gap + "f) → re-engaging " + transportName() + ".", "event");
+            reEngage();
+        }
+    }
+
+    // ---------- LiveUpdate (push): monitor + command bus ----------
+    // Minimal LiveUpdate connection: ONE subscribe (props array), auto-reconnect.
+    // onValue(index,value) — index into `properties`; setByIndex(index,value) writes.
+    // Monitor and command bus use SEPARATE connections so a bad subscribe in one
+    // can't drop the other (two subscribes on one socket was causing the flapping).
+    function makeLU(object, properties, freq, onValue, onStatus) {
+        let ws = null, ids = [], stopped = false, timer = null;
+        function connect() {
+            try { ws = new WebSocket("ws://" + getDirector() + "/api/session/liveupdate"); }
+            catch (e) { schedule(); return; }
+            ws.onopen = () => { ids = []; ws.send(JSON.stringify({ subscribe: { object: object, properties: properties, configuration: { updateFrequencyMs: freq } } })); onStatus && onStatus(true); };
+            ws.onclose = () => { ws = null; onStatus && onStatus(false); schedule(); };
+            ws.onerror = () => {};
+            ws.onmessage = (ev) => {
+                let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+                if (m.error) { log("LiveUpdate error: " + m.error, "err"); return; }
+                if (m.subscriptions) { m.subscriptions.forEach((s, i) => { ids[i] = s.id; }); return; }
+                if (m.valuesChanged) m.valuesChanged.forEach(v => { const idx = ids.indexOf(v.id); if (idx >= 0 && onValue) onValue(idx, v.value); });
+            };
+        }
+        function schedule() { if (!stopped && !timer) timer = setTimeout(() => { timer = null; connect(); }, 3000); }
+        connect();
+        return {
+            setByIndex(idx, value) { if (ws && ws.readyState === 1 && ids[idx] != null) ws.send(JSON.stringify({ set: [{ id: ids[idx], value: value }] })); },
+            stop() { stopped = true; if (timer) clearTimeout(timer); if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} ws = null; } }
+        };
+    }
+
+    let monitorLU = null, busLU = null, monitorOk = false, busOk = false, busWanted = false;
+    let busSyncIdx = -1, busReengageIdx = -1, luReengageLast, luGen = 0;
+
+    function luSetConn() {
+        const el = document.getElementById('lu-conn');
+        el.textContent = "LiveUpdate — monitor: " + (monitorOk ? "connected" : "…") + " | bus: " + (busWanted ? (busOk ? "connected" : "…") : "off");
+        el.style.color = (monitorOk && (!busWanted || busOk)) ? "#4ade80" : "#ff6b6b";
+    }
+    function luWriteSync(v) { if (busLU && busSyncIdx >= 0) busLU.setByIndex(busSyncIdx, v); }
+
+    async function connectLiveUpdate() {
+        const gen = ++luGen;
+        if (monitorLU) { monitorLU.stop(); monitorLU = null; }
+        if (busLU) { busLU.stop(); busLU = null; }
+        monitorOk = false; busOk = false; busWanted = false; busSyncIdx = -1; busReengageIdx = -1; luReengageLast = undefined;
+        const name = transportName();
+        const conn = document.getElementById('lu-conn');
+        if (!name) { conn.textContent = "LiveUpdate: pick a transport"; conn.style.color = "#aaa"; return; }
+        luSetConn();
+        // let disguise release the just-closed subscriptions before reopening (avoids a brief flap)
+        await new Promise(r => setTimeout(r, 350));
+        if (gen !== luGen) return;   // a newer reconnect superseded this one
+
+        // ---- monitor connection: incoming + position (one subscribe) ----
+        monitorLU = makeLU("transportmanager:" + name, [
+            "object.monitorString",
+            "object.beatToTimecode(object.track.timeToBeat(object.player.tCurrent)).__str__()"
+        ], 100,
+            (idx, val) => {
+                if (idx === 0) { lastIncoming = val; setClock('v-incoming', val); }
+                else if (idx === 1) { lastPosition = val; setClock('v-position', val); }
+                recomputeSync();
+            },
+            ok => { monitorOk = ok; if (ok) wasSynced = null; luSetConn(); });
+
+        // ---- command-bus connection (optional): re-engage var + sync var ----
+        const device = document.getElementById('lu-device').value.trim();
+        const reVar = document.getElementById('lu-reengage-var').value.trim();
+        const syncVar = document.getElementById('lu-sync-var').value.trim();
+        if (!busEnabled() || !(device && (reVar || syncVar))) { luSetConn(); return; }   // command bus off / not configured
+        busWanted = true; luSetConn();
+
+        let names = null;
+        try {
+            const out = await runScript(PY_EX +
+                "try:\n    _n = [str(v.name) for v in _ex.evaluateFromString(" + JSON.stringify(device) + ").container.variables]\n    print(json.dumps({'names': _n}))\nexcept BaseException as e:\n    print(json.dumps({'err': str(e)}))");
+            if (out && out.names) names = out.names;
+            else if (out && out.err) log("Device read failed: " + out.err, "err");
+        } catch (e) { log("Device resolve failed: " + e.message, "err"); }
+        if (gen !== luGen) return;   // superseded while resolving the device
+
+        const props = [];
+        if (names) {
+            const ri = reVar ? names.indexOf(reVar) : -1;
+            const si = syncVar ? names.indexOf(syncVar) : -1;
+            if (reVar && ri < 0) log("Re-engage var '" + reVar + "' not found on device.", "err");
+            if (syncVar && si < 0) log("Sync var '" + syncVar + "' not found on device.", "err");
+            if (ri >= 0) { busReengageIdx = props.length; props.push("object.container.variables[" + ri + "].defaultFloat"); }
+            if (si >= 0) { busSyncIdx = props.length; props.push("object.container.variables[" + si + "].defaultFloat"); }
+        }
+        if (!props.length) { busWanted = false; luSetConn(); return; }
+
+        busLU = makeLU(device, props, 0,
+            (idx, val) => {
+                if (idx === busReengageIdx) {
+                    // momentary: fire on change-to-nonzero, then reset to 0 so a
+                    // plain Companion "set 1" works every press (reset->0 won't re-fire)
+                    if (luReengageLast !== undefined && val !== luReengageLast && parseFloat(val)) {
+                        log("Command bus: re-engage = " + val + " → re-engaging.", "event");
+                        reEngage();
+                        busLU.setByIndex(busReengageIdx, 0);
+                    }
+                    luReengageLast = val;
+                }
+                // sync-var pushes are our own echoes — ignore.
+            },
+            ok => { busOk = ok; if (ok) wasSynced = null; luSetConn(); });
+        luSetConn();
+    }
+    function setClock(id, val) { const el = document.getElementById(id); el.textContent = (val === undefined || val === null || val === "") ? "—" : val; el.classList.remove('stale'); }
+
+    function applyConfig() {
+        save('tcsr-transport', transportName());
+        save('tcsr-device', document.getElementById('lu-device').value.trim());
+        save('tcsr-revar', document.getElementById('lu-reengage-var').value.trim());
+        save('tcsr-syncvar', document.getElementById('lu-sync-var').value.trim());
+        save('tcsr-fps', document.getElementById('fps').value);
+        save('tcsr-tol', document.getElementById('tol').value);
+        save('tcsr-auto', document.getElementById('auto-reengage').checked ? "1" : "0");
+        save('tcsr-busen', busEnabled() ? "1" : "0");
+        connectLiveUpdate();
+    }
+
+    // ---------- init ----------
+    window.addEventListener('load', async () => {
+        document.getElementById('lu-device').value = load('tcsr-device', "");
+        document.getElementById('lu-reengage-var').value = load('tcsr-revar', "");
+        document.getElementById('lu-sync-var').value = load('tcsr-syncvar', "");
+        document.getElementById('fps').value = load('tcsr-fps', "30");
+        document.getElementById('tol').value = load('tcsr-tol', "3");
+        document.getElementById('auto-reengage').checked = load('tcsr-auto', "0") === "1";
+        document.getElementById('bus-enabled').checked = load('tcsr-busen', "1") === "1";
+        document.getElementById('transport').addEventListener('change', () => { save('tcsr-transport', transportName()); connectLiveUpdate(); });
+        document.getElementById('tol').addEventListener('change', () => { save('tcsr-tol', document.getElementById('tol').value); recomputeSync(); });
+        document.getElementById('fps').addEventListener('change', () => { save('tcsr-fps', document.getElementById('fps').value); recomputeSync(); });
+        document.getElementById('auto-reengage').addEventListener('change', () => save('tcsr-auto', document.getElementById('auto-reengage').checked ? "1" : "0"));
+        document.getElementById('bus-enabled').addEventListener('change', () => { save('tcsr-busen', busEnabled() ? "1" : "0"); connectLiveUpdate(); });
+        // remember which sections are open/closed (so it stays compact during a show)
+        document.querySelectorAll('details.sec').forEach(d => {
+            const k = 'tcsr-open-' + d.id, saved = load(k, null);
+            if (saved !== null) d.open = (saved === "1");
+            d.addEventListener('toggle', () => save(k, d.open ? "1" : "0"));
+        });
+        await loadTransports();
+        connectLiveUpdate();
+    });
+</script>
+</body>
+</html>
