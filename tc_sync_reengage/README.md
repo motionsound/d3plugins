@@ -82,7 +82,7 @@ Add a **Disguise: LiveUpdate** connection and set its **Host** to the disguise D
 - **Feedbacks tab → add `LiveUpdate Variable`:**
   - **Variable Name:** `syncstatus`
   - **Object Path:** `expressionvariablesdevice:vardevice`
-  - **Property Path:** `object.container.variables[1].defaultFloat`
+  - **Property Path:** ```object.container.variables[1].defaultFloat```
     *(second variable = index 1; adjust as above)*
 - **Add two more feedbacks → `internal: Variable: Check value`:**
   - Find your `syncstatus` variable (search for it).
