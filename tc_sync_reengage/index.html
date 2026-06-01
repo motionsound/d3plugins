@@ -7,9 +7,17 @@
   - Re-Engage button (disengage -> engage) for the chosen transport (REST).
   - Auto Re-Engage on de-sync (optional).
   - LiveUpdate command bus (optional, bridge-free, drive from Companion/stream deck):
-      * a device variable that, when changed, fires Re-Engage.
-      * a device variable this plugin WRITES with the sync state (1=synced, 0=not)
+      * the plugin creates its OWN ExpressionVariables device (plugincmdbus_tcsync)
+        via the "Add Device" button — no manual Device Manager setup, no fields.
+      * tcsync_cmd    — change this -> fires Re-Engage.
+      * tcsync_status — the plugin WRITES the sync state here (1=synced, 0=not)
         so a stream-deck button can color itself.
+      * tcsync_gap    — the plugin WRITES the live gap (frames) here so a deck
+        button can show the number (pair with tcsync_status for colour).
+
+  - Frame rate (for the gap math) auto-detects from the transport's timecode device
+    (transportmanager:<name>.timecode.SMPTE_clock_type; the disguise Timecode enum:
+    0=23.98 1=24 2=25 3=29.97NDF 4=29.97DF 5=30). Falls back to transport.smpteClockType().
 
   LiveUpdate reads:
     incoming  = object.monitorString
@@ -43,6 +51,9 @@
         input, select { font-size: 13px; font-family: monospace; padding: 4px; box-sizing: border-box; }
         .field input, .field select { width: 100%; }
         .hint { font-size: 11px; color: #aaa; margin-top: 2px; }
+        .busread { font-size: 12px; margin: 8px 0; line-height: 1.5; }
+        .busread .bk { color: #aaa; }
+        .busread .bv { font-family: monospace; color: #7dd3fc; word-break: break-all; }
         .clocks { display: flex; gap: 8px; }
         .clock { flex: 1; border: 1px solid #444; border-radius: 5px; padding: 8px; text-align: center; }
         .clock .lab { font-size: 10px; color: #aaa; text-transform: uppercase; letter-spacing: .5px; }
@@ -83,8 +94,9 @@
             <label for="transport">Transport (monitor + re-engage)</label>
             <div class="row">
                 <select id="transport" class="grow"></select>
-                <button onclick="loadTransports()" title="Refresh">↻</button>
+                <button onclick="refreshTransports()" title="Refresh">↻</button>
             </div>
+            <div class="hint">Only transports with a timecode device are listed (all shown if none have one).</div>
         </div>
         <div class="btn-row">
             <button id="reengage-btn" onclick="reEngage()">Re-Engage now</button>
@@ -97,19 +109,20 @@
 
     <details class="sec" id="sec-bus">
         <summary>LiveUpdate command bus</summary>
-        <label class="chk" style="display:inline-block; margin-top:8px;"><input type="checkbox" id="bus-enabled" checked> Enable command bus</label>
+        <div class="btn-row" style="margin-top:8px;">
+            <button onclick="addDevice()">Add Device</button>
+            <button onclick="verifyDevice()">Verify Device</button>
+        </div>
+        <label class="chk" style="display:inline-block;"><input type="checkbox" id="bus-enabled" checked> Enable command bus</label>
         <div id="lu-conn" class="hint">LiveUpdate: idle</div>
-        <div class="field">
-            <label for="lu-device">ExpressionVariables device (object ref)</label>
-            <input type="text" id="lu-device" spellcheck="false" placeholder="expressionvariablesdevice:vardevice">
-        </div>
-        <div class="field">
-            <label for="lu-reengage-var">Re-engage when this variable changes</label>
-            <input type="text" id="lu-reengage-var" spellcheck="false" placeholder="e.g. reengagecmd">
-        </div>
-        <div class="field">
-            <label for="lu-sync-var">Write sync state (1=synced, 0=not) to this variable</label>
-            <input type="text" id="lu-sync-var" spellcheck="false" placeholder="e.g. syncstatus">
+        <div class="busread" id="busread">
+            <div id="busread-empty" class="bk">—  No command-bus device yet. Click <b>Add Device</b>.</div>
+            <div id="busread-detail" style="display:none;">
+                <div><span class="bk">Device name:</span> <span class="bv">expressionvariablesdevice:plugincmdbus_tcsync</span></div>
+                <div><span class="bk">Re-engage when this variable changes:</span> <span class="bv">tcsync_cmd</span></div>
+                <div><span class="bk">Write sync state (1=synced, 0=not) to this variable:</span> <span class="bv">tcsync_status</span></div>
+                <div><span class="bk">Write the live gap (frames) to this variable:</span> <span class="bv">tcsync_gap</span></div>
+            </div>
         </div>
         <div class="row"><button onclick="applyConfig()">Apply / reconnect</button></div>
     </details>
@@ -117,11 +130,21 @@
     <details class="sec" id="sec-adv">
         <summary>Advanced</summary>
         <div class="field" style="margin-top:8px;">
-            <label for="fps">Frame rate (for the gap math)</label>
-            <select id="fps">
-                <option>23.98</option><option>24</option><option>25</option><option>29.97</option>
-                <option selected>30</option><option>48</option><option>50</option><option>59.94</option><option>60</option>
-            </select>
+            <label for="fps">Timecode frame rate (for the gap math)</label>
+            <div class="row">
+                <select id="fps" class="grow">
+                    <option value="0">23.98</option>
+                    <option value="1">24</option>
+                    <option value="2">25</option>
+                    <option value="4">29.97 DF</option>
+                    <option value="3">29.97 NDF</option>
+                    <option value="5" selected>30</option>
+                </select>
+                <button id="fps-detect-btn" onclick="detectFps(true)" title="Detect from the transport's timecode device">Detect</button>
+            </div>
+            <div class="hint">Auto-detected from the transport's SMPTE clock type when you pick a transport.</div>
+            <label class="chk" style="display:inline-block; margin-top:4px;"><input type="checkbox" id="fps-override"> Override — set frame rate manually (stop auto-detecting)</label>
+            <div id="fps-readout" class="hint"></div>
         </div>
         <div class="field">
             <label for="tol">Sync tolerance (± frames)</label>
@@ -159,8 +182,40 @@
     }
     const PY_EX = "import json\ntry:\n    _ex = Expression\nexcept NameError:\n    import d3\n    _ex = d3.Expression\n";
 
+    // ---------- command bus identity (this plugin owns its own device) ----------
+    // Each command-bus plugin creates its OWN ExpressionVariables device with
+    // uniquely-named variables, so the object ref + var names are universal (the
+    // user never types anything) and var names never collide across plugins
+    // (disguise allows only one variable of a given name per project).
+    const BUS_DEVNAME = "plugincmdbus_tcsync";                         // bare name (for creation)
+    const BUS_DEVICE  = "expressionvariablesdevice:" + BUS_DEVNAME;    // object ref (for LiveUpdate)
+    const BUS_REVAR   = "tcsync_cmd";      // change this -> re-engage             (Companion index [0])
+    const BUS_SYNCVAR = "tcsync_status";   // plugin WRITES sync state here (1/0)   (Companion index [1])
+    const BUS_GAPVAR  = "tcsync_gap";      // plugin WRITES the live gap (frames)   (Companion index [2])
+
+    // Robust DeviceManager lookup. The project has exactly ONE DeviceManager, but
+    // its ref token (devicemanager:default) depends on its name. Grabbing the single
+    // resource instead is name-independent, so the command bus works even if the
+    // Device Manager isn't called "default". (_ex comes from PY_EX.)
+    const PY_DM =
+        "import d3\n" +
+        "def _getdm():\n" +
+        "    _d = list(d3.resourceManager.allResources(d3.DeviceManager))\n" +
+        "    return _d[0] if _d else _ex.evaluateFromString('devicemanager:default')\n";
+
     function transportName() { return document.getElementById('transport').value; }
-    function fps() { return Math.round(parseFloat(document.getElementById('fps').value)) || 30; }   // 23.98->24, 29.97->30, 59.94->60
+    // dropdown value = disguise SMPTE clock type (Timecode enum): 0=23.98 1=24 2=25
+    // 3=29.97NDF 4=29.97DF 5=30. Map to the INTEGER fps the gap math uses.
+    const SMPTE_MATH_FPS = { 0: 24, 1: 24, 2: 25, 3: 30, 4: 30, 5: 30 };
+    function fps() { return SMPTE_MATH_FPS[parseInt(document.getElementById('fps').value, 10)] || 30; }
+    function fpsOverride() { return document.getElementById('fps-override').checked; }   // manual mode: don't auto-detect
+    function syncFpsOverrideUI() { document.getElementById('fps-detect-btn').disabled = fpsOverride(); }
+    // frame-rate feedback lives in Advanced (not the main status line — keep that for show-critical info)
+    function setFpsMsg(msg, kind) {
+        const el = document.getElementById('fps-readout');
+        el.textContent = msg || "";
+        el.style.color = kind === 'warn' ? "#ff6b6b" : kind === 'muted' ? "#aaa" : "#4ade80";
+    }
     function tolerance() { const v = parseInt(document.getElementById('tol').value, 10); return isNaN(v) ? 3 : v; }
     function autoReengage() { return document.getElementById('auto-reengage').checked; }
     function busEnabled() { return document.getElementById('bus-enabled').checked; }
@@ -170,12 +225,86 @@
         let list = [];
         try { const r = await fetch(base() + "/api/session/transport/transports").then(x => x.json()); list = (r && r.transports) || []; }
         catch (e) { setStatus("Couldn't load transports: " + e.message, "error"); }
+
+        // Keep only transports with a timecode device patched (transport.timecode != None).
+        // If none have one (e.g. mid-setup), fall back to showing all so the picker isn't empty.
+        if (list.length) {
+            try {
+                const out = await runScript(PY_EX +
+                    "names = " + JSON.stringify(list.map(t => t.name)) + "\n" +
+                    "res = {}\n" +
+                    "for n in names:\n" +
+                    "    try:\n" +
+                    "        res[n] = (_ex.evaluateFromString('transportmanager:' + n).timecode is not None)\n" +
+                    "    except BaseException:\n" +
+                    "        res[n] = False\n" +
+                    "print(json.dumps(res))");
+                if (out) {
+                    const filtered = list.filter(t => out[t.name]);
+                    if (filtered.length) list = filtered;
+                }
+            } catch (e) { /* on error, leave the list unfiltered */ }
+        }
+
         const sel = document.getElementById('transport');
         let want = sel.value || load('tcsr-transport', "");
         sel.replaceChildren();
         const b = document.createElement('option'); b.value = ""; b.textContent = "— select —"; sel.appendChild(b);
         list.forEach(t => { const o = document.createElement('option'); o.value = t.name; o.textContent = t.name + (t.engaged ? "" : "  (disengaged)"); sel.appendChild(o); });
+
+        // Restore the saved selection if it's still listed; otherwise auto-select when
+        // there's exactly one timecode transport.
         if (want && [...sel.options].some(o => o.value === want)) sel.value = want;
+        else if (list.length === 1) { sel.value = list[0].name; save('tcsr-transport', sel.value); }
+    }
+
+    // Refresh button: reload the (filtered) list, then re-detect fps + reconnect to the selection.
+    async function refreshTransports() { await loadTransports(); detectFps(false); connectLiveUpdate(); }
+
+    // ---------- auto-detect timecode frame rate from the transport ----------
+    // Reads transportmanager:<name>.timecode.SMPTE_clock_type (the timecode device's
+    // SMPTE clock dropdown). Falls back to the transport's own smpteClockType() if no
+    // device is patched. Feedback goes to the Advanced readout (setFpsMsg), not the
+    // main status line. manual=true => also report "pick a transport" if none chosen.
+    async function detectFps(manual) {
+        if (!manual && fpsOverride()) return;   // override on: skip auto-detect (load / transport change)
+        const name = transportName();
+        if (!name) { if (manual) setFpsMsg("Pick a transport first.", "warn"); return; }
+        try {
+            const out = await runScript(PY_EX +
+                "name = " + JSON.stringify(name) + "\n" +
+                "try:\n" +
+                "    t = _ex.evaluateFromString('transportmanager:' + name)\n" +
+                "    ct = None\n" +
+                "    try:\n" +
+                "        d = t.timecode\n" +
+                "        if d is not None: ct = int(d.SMPTE_clock_type)\n" +
+                "    except BaseException: pass\n" +
+                "    if ct is None:\n" +
+                "        try: ct = int(t.smpteClockType())\n" +
+                "        except BaseException: pass\n" +
+                "    print(json.dumps({'ok': True, 'ct': ct}))\n" +
+                "except BaseException as e:\n" +
+                "    print(json.dumps({'ok': False, 'error': str(e)}))");
+            if (out && out.ok && out.ct !== null && out.ct !== undefined) {
+                const sel = document.getElementById('fps');
+                if ([...sel.options].some(o => o.value === String(out.ct))) {
+                    sel.value = String(out.ct);
+                    save('tcsr-fps', sel.value);
+                    recomputeSync();
+                    const label = sel.options[sel.selectedIndex].textContent;
+                    log("Detected timecode rate: " + label + " on " + name + ".", "event");
+                    setFpsMsg("Frame rate set to " + label + " from the timecode device.");
+                } else {
+                    setFpsMsg("Detected clock type " + out.ct + " has no matching option.", "warn");
+                }
+            } else {
+                log("No timecode rate detected on " + name + " (no device?). Frame rate left manual.", "err");
+                setFpsMsg("No timecode device on " + name + " — set the frame rate manually.", "warn");
+            }
+        } catch (e) {
+            setFpsMsg("Detect failed: " + e.message, "warn");
+        }
     }
 
     // ---------- re-engage (REST, by uid) ----------
@@ -211,7 +340,14 @@
         if (p.length === 4) [h, m, sec, fr] = p; else if (p.length === 3) [h, m, sec] = p; else return null;
         return ((h * 60 + m) * 60 + sec) * f + fr;
     }
-    let lastIncoming = "", lastPosition = "", wasSynced = null, lastAutoReengage = 0;
+    let lastIncoming = "", lastPosition = "", wasSynced = null, lastAutoReengage = 0, lastGapWritten = null, gapSamples = [];
+    // Smoothing for the PUBLISHED gap variable ONLY (the sync light / auto-reengage use
+    // the raw gap and are untouched): a moving average over the last GAP_AVG_SAMPLES
+    // pushes, then a GAP_HOLD band so the deck readout sits near the true value without
+    // flickering on the inherent ±1-frame sampling jitter. Bigger window/hold = calmer
+    // but laggier.
+    const GAP_AVG_SAMPLES = 16;   // ~1–1.5 s of history at the 100 ms push rate
+    const GAP_HOLD = 0.75;        // only move the shown integer once the average drifts this far
     function recomputeSync() {
         const f = fps();
         const inc = parseTC(lastIncoming, f), pos = parseTC(lastPosition, f);
@@ -223,6 +359,11 @@
         lightEl.className = "light " + (synced ? "synced" : "notsynced");
         gapEl.textContent = "gap " + (gap >= 0 ? "+" : "") + gap + "f (±" + tolerance() + " ok)";
         if (synced !== wasSynced) { luWriteSync(synced ? 1 : 0); wasSynced = synced; }   // publish on change
+        // publish a SMOOTHED gap (moving average + hold band) so the deck doesn't flicker
+        gapSamples.push(gap);
+        while (gapSamples.length > GAP_AVG_SAMPLES) gapSamples.shift();
+        const gapAvg = gapSamples.reduce((a, b) => a + b, 0) / gapSamples.length;
+        if (lastGapWritten === null || Math.abs(gapAvg - lastGapWritten) >= GAP_HOLD) { lastGapWritten = Math.round(gapAvg); luWriteGap(lastGapWritten); }
         // Auto Re-Engage: retry while de-synced (cooldown); re-arm when synced — works repeatedly.
         if (synced) {
             lastAutoReengage = 0;
@@ -262,7 +403,7 @@
     }
 
     let monitorLU = null, busLU = null, monitorOk = false, busOk = false, busWanted = false;
-    let busSyncIdx = -1, busReengageIdx = -1, luReengageLast, luGen = 0;
+    let busSyncIdx = -1, busReengageIdx = -1, busGapIdx = -1, luReengageLast, luGen = 0;
 
     function luSetConn() {
         const el = document.getElementById('lu-conn');
@@ -270,12 +411,128 @@
         el.style.color = (monitorOk && (!busWanted || busOk)) ? "#4ade80" : "#ff6b6b";
     }
     function luWriteSync(v) { if (busLU && busSyncIdx >= 0) busLU.setByIndex(busSyncIdx, v); }
+    function luWriteGap(g) { if (busLU && busGapIdx >= 0) busLU.setByIndex(busGapIdx, g); }
+
+    // ---------- command-bus device: readout state ----------
+    // The readout stays "—" until the device actually exists/is active. One quiet
+    // check on load is enough (it persists once created); Add/Verify also refresh it.
+    function setBusReadout(present) {
+        document.getElementById('busread-empty').style.display = present ? "none" : "";
+        document.getElementById('busread-detail').style.display = present ? "" : "none";
+    }
+    async function busDevicePresent() {
+        try {
+            const out = await runScript(PY_EX + PY_DM +
+                "try:\n" +
+                "    _ex.evaluateFromString(" + JSON.stringify(BUS_DEVICE) + ")\n" +
+                "    dm = _getdm()\n" +
+                "    a = any(d.name == " + JSON.stringify(BUS_DEVNAME) + " for d in list(dm.devices))\n" +
+                "    print(json.dumps({'present': a}))\n" +
+                "except BaseException:\n" +
+                "    print(json.dumps({'present': False}))");
+            return !!(out && out.present);
+        } catch (e) { return false; }
+    }
+    async function refreshBusReadout() { setBusReadout(await busDevicePresent()); }
+
+    // ---------- command-bus device: create / verify ----------
+    // Proven recipe: resourceManager.loadOrCreate registers the device resource,
+    // then DeviceManager.devices.addItemIfNotFound makes it active in the project,
+    // then grow the variables vector and set each new var by index (type 0 = float).
+    async function addDevice() {
+        setStatus("Adding command-bus device…");
+        log("Add device " + BUS_DEVNAME + " (" + BUS_REVAR + ", " + BUS_SYNCVAR + ")…", "event");
+        const py = PY_EX + PY_DM +
+            "devname = " + JSON.stringify(BUS_DEVNAME) + "\n" +
+            "varnames = " + JSON.stringify([BUS_REVAR, BUS_SYNCVAR, BUS_GAPVAR]) + "\n" +
+            "res = {'steps': []}\n" +
+            "S = res['steps'].append\n" +
+            "try:\n" +
+            "    pathstr = 'objects/expressionvariablesdevice/' + devname + '.apx'\n" +
+            "    dev = d3.resourceManager.loadOrCreate(d3.Path(pathstr), d3.ExpressionVariablesDevice)\n" +
+            "    S('resource ready: ' + str(dev.path))\n" +
+            "    try:\n" +
+            "        dm = _getdm()\n" +
+            "        dm.devices.addItemIfNotFound(dev)\n" +
+            "        S('activated in project')\n" +
+            "    except BaseException as ae:\n" +
+            "        S('activate failed: ' + str(ae))\n" +
+            "    cont = dev.container\n" +
+            "    existing = [v.name for v in list(cont.variables)]\n" +
+            "    toadd = [n for n in varnames if n and n not in existing]\n" +
+            "    b = len(existing)\n" +
+            "    if toadd:\n" +
+            "        cont.variables.resize(b + len(toadd))\n" +
+            "        for j, nm in enumerate(toadd):\n" +
+            "            el = dev.container.variables[b + j]\n" +
+            "            el.name = nm; el.type = 0; el.defaultFloat = 0.0\n" +
+            "            S('added var: ' + nm)\n" +
+            "    res['ok'] = True\n" +
+            "    res['vars'] = [v.name for v in list(dev.container.variables)]\n" +
+            "except BaseException as e:\n" +
+            "    res['ok'] = False; S('FAILED: ' + str(e))\n" +
+            "print(json.dumps(res))\n";
+        try {
+            const out = await runScript(py);
+            (out && out.steps || []).forEach(s => log(s));
+            if (out && out.ok) {
+                log("Device vars: " + JSON.stringify(out.vars), "event");
+                setBusReadout(true);
+                setStatus("Command-bus device ready. Reconnecting…", "success");
+                applyConfig();   // reconnect now that the device exists
+            } else {
+                setStatus("Couldn't create device — see log.", "error");
+            }
+        } catch (e) {
+            setStatus("Error: " + e.message, "error");
+            log("Add device error: " + e.message, "err");
+        }
+    }
+
+    async function verifyDevice() {
+        log("Verify " + BUS_DEVICE + "…", "event");
+        const py = PY_EX + PY_DM +
+            "try:\n" +
+            "    dev = _ex.evaluateFromString(" + JSON.stringify(BUS_DEVICE) + ")\n" +
+            "    info = [{'name': v.name, 'defaultFloat': float(v.defaultFloat)} for v in list(dev.container.variables)]\n" +
+            "    dm = _getdm()\n" +
+            "    active = any(d.name == " + JSON.stringify(BUS_DEVNAME) + " for d in list(dm.devices))\n" +
+            "    print(json.dumps({'ok': True, 'vars': info, 'active': active}))\n" +
+            "except BaseException as e:\n" +
+            "    print(json.dumps({'ok': False, 'error': str(e)}))\n";
+        try {
+            const out = await runScript(py);
+            if (out && out.ok) {
+                const names = out.vars.map(v => v.name);
+                log("Found. Active in project: " + out.active + ". Vars: " + JSON.stringify(names), "event");
+                setBusReadout(!!out.active);
+                const haveCmd = names.indexOf(BUS_REVAR) >= 0, haveStatus = names.indexOf(BUS_SYNCVAR) >= 0, haveGap = names.indexOf(BUS_GAPVAR) >= 0;
+                if (out.active && haveCmd && haveStatus && haveGap) {
+                    setStatus("Device OK — active, all variables present.", "success");
+                } else {
+                    const miss = [];
+                    if (!out.active) miss.push("not active");
+                    if (!haveCmd) miss.push("missing " + BUS_REVAR);
+                    if (!haveStatus) miss.push("missing " + BUS_SYNCVAR);
+                    if (!haveGap) miss.push("missing " + BUS_GAPVAR);
+                    setStatus("Device incomplete: " + miss.join("; ") + ". Click Add Device.", "error");
+                }
+            } else {
+                log("Not found: " + (out && out.error), "err");
+                setBusReadout(false);
+                setStatus("Device not found — click Add Device.", "error");
+            }
+        } catch (e) {
+            setStatus("Error: " + e.message, "error");
+            log("Verify error: " + e.message, "err");
+        }
+    }
 
     async function connectLiveUpdate() {
         const gen = ++luGen;
         if (monitorLU) { monitorLU.stop(); monitorLU = null; }
         if (busLU) { busLU.stop(); busLU = null; }
-        monitorOk = false; busOk = false; busWanted = false; busSyncIdx = -1; busReengageIdx = -1; luReengageLast = undefined;
+        monitorOk = false; busOk = false; busWanted = false; busSyncIdx = -1; busReengageIdx = -1; busGapIdx = -1; luReengageLast = undefined; lastGapWritten = null; gapSamples = [];
         const name = transportName();
         const conn = document.getElementById('lu-conn');
         if (!name) { conn.textContent = "LiveUpdate: pick a transport"; conn.style.color = "#aaa"; return; }
@@ -296,11 +553,9 @@
             },
             ok => { monitorOk = ok; if (ok) wasSynced = null; luSetConn(); });
 
-        // ---- command-bus connection (optional): re-engage var + sync var ----
-        const device = document.getElementById('lu-device').value.trim();
-        const reVar = document.getElementById('lu-reengage-var').value.trim();
-        const syncVar = document.getElementById('lu-sync-var').value.trim();
-        if (!busEnabled() || !(device && (reVar || syncVar))) { luSetConn(); return; }   // command bus off / not configured
+        // ---- command-bus connection (optional): re-engage var + sync var + gap var ----
+        const device = BUS_DEVICE, reVar = BUS_REVAR, syncVar = BUS_SYNCVAR, gapVar = BUS_GAPVAR;
+        if (!busEnabled()) { luSetConn(); return; }   // command bus off
         busWanted = true; luSetConn();
 
         let names = null;
@@ -316,10 +571,13 @@
         if (names) {
             const ri = reVar ? names.indexOf(reVar) : -1;
             const si = syncVar ? names.indexOf(syncVar) : -1;
+            const gi = gapVar ? names.indexOf(gapVar) : -1;
             if (reVar && ri < 0) log("Re-engage var '" + reVar + "' not found on device.", "err");
             if (syncVar && si < 0) log("Sync var '" + syncVar + "' not found on device.", "err");
+            if (gapVar && gi < 0) log("Gap var '" + gapVar + "' not found on device.", "err");
             if (ri >= 0) { busReengageIdx = props.length; props.push("object.container.variables[" + ri + "].defaultFloat"); }
             if (si >= 0) { busSyncIdx = props.length; props.push("object.container.variables[" + si + "].defaultFloat"); }
+            if (gi >= 0) { busGapIdx = props.length; props.push("object.container.variables[" + gi + "].defaultFloat"); }
         }
         if (!props.length) { busWanted = false; luSetConn(); return; }
 
@@ -335,18 +593,15 @@
                     }
                     luReengageLast = val;
                 }
-                // sync-var pushes are our own echoes — ignore.
+                // sync-var and gap-var pushes are our own echoes — ignore.
             },
-            ok => { busOk = ok; if (ok) wasSynced = null; luSetConn(); });
+            ok => { busOk = ok; if (ok) { wasSynced = null; lastGapWritten = null; } luSetConn(); });
         luSetConn();
     }
     function setClock(id, val) { const el = document.getElementById(id); el.textContent = (val === undefined || val === null || val === "") ? "—" : val; el.classList.remove('stale'); }
 
     function applyConfig() {
         save('tcsr-transport', transportName());
-        save('tcsr-device', document.getElementById('lu-device').value.trim());
-        save('tcsr-revar', document.getElementById('lu-reengage-var').value.trim());
-        save('tcsr-syncvar', document.getElementById('lu-sync-var').value.trim());
         save('tcsr-fps', document.getElementById('fps').value);
         save('tcsr-tol', document.getElementById('tol').value);
         save('tcsr-auto', document.getElementById('auto-reengage').checked ? "1" : "0");
@@ -356,16 +611,21 @@
 
     // ---------- init ----------
     window.addEventListener('load', async () => {
-        document.getElementById('lu-device').value = load('tcsr-device', "");
-        document.getElementById('lu-reengage-var').value = load('tcsr-revar', "");
-        document.getElementById('lu-sync-var').value = load('tcsr-syncvar', "");
-        document.getElementById('fps').value = load('tcsr-fps', "30");
+        (function () { const sel = document.getElementById('fps'), sv = load('tcsr-fps', "5"); sel.value = [...sel.options].some(o => o.value === sv) ? sv : "5"; })();
+        document.getElementById('fps-override').checked = load('tcsr-fpsoverride', "0") === "1";
+        syncFpsOverrideUI();
         document.getElementById('tol').value = load('tcsr-tol', "3");
         document.getElementById('auto-reengage').checked = load('tcsr-auto', "0") === "1";
         document.getElementById('bus-enabled').checked = load('tcsr-busen', "1") === "1";
-        document.getElementById('transport').addEventListener('change', () => { save('tcsr-transport', transportName()); connectLiveUpdate(); });
+        document.getElementById('transport').addEventListener('change', () => { save('tcsr-transport', transportName()); detectFps(false); connectLiveUpdate(); });
         document.getElementById('tol').addEventListener('change', () => { save('tcsr-tol', document.getElementById('tol').value); recomputeSync(); });
         document.getElementById('fps').addEventListener('change', () => { save('tcsr-fps', document.getElementById('fps').value); recomputeSync(); });
+        document.getElementById('fps-override').addEventListener('change', () => {
+            save('tcsr-fpsoverride', fpsOverride() ? "1" : "0");
+            syncFpsOverrideUI();
+            if (fpsOverride()) setFpsMsg("Manual override on — auto-detect off.", "muted");
+            else detectFps(false);   // turning override OFF re-syncs to the timecode device
+        });
         document.getElementById('auto-reengage').addEventListener('change', () => save('tcsr-auto', document.getElementById('auto-reengage').checked ? "1" : "0"));
         document.getElementById('bus-enabled').addEventListener('change', () => { save('tcsr-busen', busEnabled() ? "1" : "0"); connectLiveUpdate(); });
         // remember which sections are open/closed (so it stays compact during a show)
@@ -375,6 +635,8 @@
             d.addEventListener('toggle', () => save(k, d.open ? "1" : "0"));
         });
         await loadTransports();
+        await detectFps(false);   // auto-match frame rate to the transport's timecode device
+        refreshBusReadout();   // show the readout only if the device already exists
         connectLiveUpdate();
     });
 </script>
