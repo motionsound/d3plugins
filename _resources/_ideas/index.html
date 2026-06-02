@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<!--
+  ACTIVE IDEAS / PARKING LOT
+  ==========================
+  Things we figured out (or partly figured out) but pulled out of the live plugins.
+  Open this in a browser to read; copy code back into a plugin when revisiting.
+  Not meant to be a working Designer plugin (no API calls) — just a scratchpad.
+-->
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Active Ideas</title>
+    <meta name="disguise-plugin-window-size" content="640,720">
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 16px; color: #eee; background: #1b1b1b; }
+        .container { max-width: 760px; margin: 0 auto; }
+        h1 { font-size: 20px; }
+        h2 { font-size: 16px; margin-top: 26px; border-bottom: 1px solid #444; padding-bottom: 4px; }
+        .status { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 3px; margin-left: 8px; vertical-align: middle; }
+        .parked { background: #4c3a1d; color: #fbbf24; }
+        .works { background: #14532d; color: #4ade80; }
+        .open { background: #4c1d1d; color: #ff6b6b; }
+        p, li { line-height: 1.5; font-size: 14px; }
+        code { background: #2a2a2a; padding: 1px 4px; border-radius: 3px; font-size: 13px; }
+        pre { background: #111; border: 1px solid #333; border-radius: 6px; padding: 10px; overflow-x: auto; font-size: 12px; line-height: 1.4; }
+        .why { color: #9aa; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>Active Ideas / Parking Lot</h1>
+    <p class="why">Stuff we cracked or half-cracked, pulled out of the live plugins to keep them solid.
+    Each entry: what it does, why it's parked, and the code/recipe to revive it.</p>
+
+    <h2>1. Clip thumbnails <span class="status works">recipe works</span> <span class="status open">render is intermittent</span></h2>
+    <p>A small frame-0 still per video, via the <b>LIVE</b> ThumbnailSystem instance.
+       The recipe is correct and has returned real frames for un-previewed assets — BUT it's
+       <b>intermittent</b>: some sessions the engine's thumbnail render never runs and every call
+       returns the 128×128 "?" placeholder (even with retries). Pulled from <code>video_countdowns</code>
+       on 2026-06-01 until we understand what makes the engine's thumbnail pump run (GPU load? a trigger?).</p>
+    <p><b>The recipe (Python via /api/session/python/execute):</b></p>
+    <pre>import d3
+ts = d3.subsystems.getSystem(d3.ThumbnailSystem)   # the LIVE engine instance (NOT a fresh ThumbnailSystem())
+f  = _ex.evaluateFromString("transportmanager:&lt;T&gt;").track.findLayerByName("&lt;layer&gt;").module.video.file
+tex = ts.getThumbnail(f, ts.getThumbnailSize(f), 0)   # frame 0 @ native size. WHEN it works: real frame instantly.
+# tex is a DxTexture; None or 128x128 "?" = not ready / placeholder.
+tex.download(True); tex.saveFile(path)                # DxTexture.saveFile writes a PNG
+# read bytes -> base64 -> data URI in the page:  img.src = "data:image/png;base64," + b64
+# detect placeholder by PNG dims: real = (w,h) != (128,128)  [IHDR: struct.unpack('&gt;I', b[16:20]) / b[20:24]]
+# NOTE: only frame 0 / native size is reliable. Other frames + non-native sizes render async (placeholder first).
+# renderPreview(Rect,Colour,bool,bool) draws to SCREEN (returns None) — not a capturable texture.</pre>
+    <p><b>Removed JS (drop back into a plugin with rows keyed by layer):</b></p>
+    <pre>// CSS
+.vthumb { display:none; width:86px; object-fit:cover; border-radius:4px; background:#000; align-self:stretch; }
+#videos.show-thumbs .vthumb { display:block; }
+
+// row HTML: prepend  &lt;img class="vthumb" alt=""&gt;  inside the flex .vrow (before .vbody)
+
+let thumbCache = {}, thumbsGenerating = {};
+function thumbsOn() { const el = document.getElementById('thumbs'); return el &amp;&amp; el.checked; }
+function thumbScript(t, n) {
+    return PY_EX +
+        "import tempfile, os, base64, struct\nimport d3\n" +
+        "T = 'transportmanager:' + " + JSON.stringify(t) + "\n" +
+        "name = " + JSON.stringify(n) + "\n" +
+        "try:\n" +
+        "    f = _ex.evaluateFromString(T).track.findLayerByName(name).module.video.file\n" +
+        "    ts = d3.subsystems.getSystem(d3.ThumbnailSystem)\n" +
+        "    tex = ts.getThumbnail(f, ts.getThumbnailSize(f), 0)\n" +
+        "    if tex is None:\n" +
+        "        print(json.dumps({'ok':True,'ready':False}))\n" +
+        "    else:\n" +
+        "        p = os.path.join(tempfile.gettempdir(), 'vc_thumb.png')\n" +
+        "        tex.download(True); tex.saveFile(p); b = open(p,'rb').read(); os.remove(p)\n" +
+        "        w = struct.unpack('&gt;I', b[16:20])[0]; h = struct.unpack('&gt;I', b[20:24])[0]\n" +
+        "        print(json.dumps({'ok':True,'ready':True,'real': not (w==128 and h==128), 'b64': base64.b64encode(b)}))\n" +
+        "except BaseException as e:\n" +
+        "    print(json.dumps({'ok':False,'error':str(e)}))\n";
+}
+// genRowThumb: retry across calls (setTimeout ~1s, up to ~6x) until out.real, then cache + set img.src.
+// ensureThumbs(): if thumbsOn(), genRowThumb(each row). Call on layer-set change + toggle.</pre>
+
+    <h2>2. Master fade state — <code>feedOutputMode</code> <span class="status open">not API-readable</span></h2>
+    <p>Goal: show "INACTIVE — FADED DOWN / HOLD" when the project's master output is faded.
+       disguise's OSC custom-monitoring exposes <code>feedOutputMode</code> = "Fade up" / "Fade down" /
+       "Output hold" (r30.7+), but like <code>currentFeatureName</code> it's an OSC/expression-bar variable,
+       NOT on the API objects we can reach. Found only actions (<code>guisystem.feed.startFadeDown</code>,
+       <code>onHoldOutput</code>, <code>fadeCol</code>) and <code>d3.d3.state</code> (a D3State with
+       <code>enableBlackout</code> but no fade-up/hold/down enum). The <code>statusOf()</code> in video_countdowns
+       already has the hooks (<code>M.fadeState === 'down'|'hold'</code>) — just need a readable source.
+       Possible revive: route feedOutputMode via OSC-out → a device variable → read over LiveUpdate (command-bus style).</p>
+
+    <h2>3. "Screenshot this frame at full res" <span class="status parked">idea</span></h2>
+    <p>Since <code>DxTexture.saveFile()</code> writes PNGs, a "grab a full-resolution still of a clip's
+       current/arbitrary frame" feature could be cool. Blocked by the same thing as #1: arbitrary-frame
+       extraction (3rd arg of getThumbnail) only reliably returns frame 0; other frames render async/placeholder,
+       and there's no found path to a full-res on-demand decode. Revisit alongside #1.</p>
+
+    <h2>4. Multi-transport render binding <span class="status open">disguise limitation</span></h2>
+    <p>Render-state (<code>module.frameNumberDisplay</code> / <code>tSecElapsed</code>) only populates for ONE
+       transport at a time (an internal binding latched to whichever transport was accessed first; survives
+       editor switches and even single-transport mode). <code>guisystem.currentTransportManager</code> is
+       read-only; <code>transport.activate()</code> doesn't switch it; no setter found. video_countdowns
+       sidesteps this: it shows ALL transports and uses each transport's own <code>tCurrent</code> — so
+       Layer/Section clocks work everywhere, only the Clip method + mute are limited to the bound transport.
+       Revive idea: if a real "make this transport active for render" command is ever found, add a button.</p>
+</div>
+</body>
+</html>

@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<!--
+  disguise (d3) Designer plugin TEMPLATE
+  ======================================
+  Copy this whole folder to start a new plugin, then:
+    1. Rename the folder.
+    2. Change <title> and the <h1> below.
+    3. Build your UI inside <div class="container"> and your logic in <script>.
+
+  ---------------------------------------------------------------------------
+  DESIGNER API CHEAT SHEET (hard-won; see the helpers below for working code)
+  ---------------------------------------------------------------------------
+  • The plugin is a web page. Designer passes ?director=<host> in the URL; talk
+    to Designer over its REST API at http://<director>/api/session/...
+
+  • Run Python:  POST /api/session/python/execute  body { "script": "<py>" }
+      - Designer runs PYTHON 2.7.
+      - It IGNORES a `returnValue` variable. To get data back, PRINT it and read
+        the response's `pythonLog` field. (runScript() below does this.)
+      - It runs on Designer's MAIN THREAD: polling it fast (sub-second, or many
+        calls/tick) FREEZES the Designer UI. Keep polls >= ~1000ms and only poll
+        when you actually need live data.
+
+  • disguise expression evaluator (the expression-bar language), from Python:
+        Expression.evaluateFromString("transportmanager:default.player.tCurrent")
+      - Reference objects as  name:instance , e.g.  transportmanager:default .
+        Bare names like `transport` / `currentBeat` do NOT resolve here.
+      - Evaluator errors raise as BaseException (NOT Exception) — catch
+        BaseException or the call aborts.
+      - Some members are properties (no parens: .tCurrent, .lengthInBeats),
+        others are callables (need parens: .cueBeats(), .nSections()).
+      - On evaluated objects you can use Python attribute access / method calls
+        (e.g. obj._classInfo, getattr(obj,'Play')) and reflection:
+        obj._classInfo.methods -> MethodInfo (has .name, .argTypes, .returnType).
+
+  • Useful REST transport endpoints (body uses a `transports` array):
+        GET  /api/session/transport/activetransport   -> {result:[{uid,name,playmode,currentTrack,setList,...}]}
+        POST /api/session/transport/play | stop        body {transports:[{uid,name}]}
+        POST /api/session/transport/gototime           body {transports:[{transport:{name},time:<sec>,playmode:"X"}]}
+        POST /api/session/transport/gototrack          body {transports:[{transport:{name},track:{name},playmode:"X"}]}
+        POST /api/session/transport/gotosection        body {transports:[{transport:{name},section:"",playmode:"X"}]}
+      - gototime/gototrack/gotosection take an OPTIONAL `playmode` string.
+      - PlayMode strings: "Play", "PlaySection", "LoopSection", "Stop", "HoldSection", "HoldEnd".
+      - gototime is by SECONDS; convert a beat with track.beatToTime(beat).
+
+  • Status responses: {status:{code:0,message:""}} — code 0 = success.
+
+  • ★ LIVEUPDATE — native WebSocket PUSH API; the PREFERRED way to read/write live
+    data (no polling, no bridge). The plugin connects directly:
+        ws://<director>/api/session/liveupdate   (browsers can be WS CLIENTS)
+    Subscribe: {"subscribe":{"object":"<expr ref>","properties":["object.<expr>"],
+                 "configuration":{"updateFrequencyMs":0}}}   (0 = push every change)
+      -> {"subscriptions":[{id,objectPath,propertyPath}]} then PUSHES
+         {"valuesChanged":[{id,value,changeTimestamp}]} on change.
+    Write: {"set":[{id,value}]} (settable props only; computed/keyframed = read-only).
+    Property paths are REAL python attribute access (reach a layer's module via
+    .module). LiveUpdate DOES expose live render-state (e.g. tSecElapsed) that
+    python/execute returns as 0. A reusable LiveUpdate COMMAND BUS is included
+    below, COMMENTED OUT — search "OPTIONAL LIVEUPDATE COMMAND BUS".
+
+  • ★ GLOBAL COMMAND BUS (external control in, no layers/OSC/bridge): make an
+    ExpressionVariables DEVICE (Device Manager) with Float vars. Object ref
+    `expressionvariablesdevice:<devname>`; vars at object.container.variables
+    (each ExpressionVariable; live float value = .defaultFloat, settable).
+      - read by name: next((v.defaultFloat for v in object.container.variables if v.name=="cmd1"), None)
+      - write by index ({set}): object.container.variables[0].defaultFloat
+    Companion's "Disguise LiveUpdate" module sets these; the plugin subscribes &
+    reacts. Works remotely (Host = disguise IP).
+
+  • TIMELINE -> PLUGIN TRIGGERS without LiveUpdate (POLL the expression API;
+    address transports by EXACT name — Multi Transport makes "active" ambiguous):
+      - playhead time: transportmanager:<name>.player.tCurrent  (seconds, live)
+      - active layers (by name): transportmanager:<name>.player.activeLayers ("<Layer 'NAME'>")
+      - a layer's authored TEXT: ...track.findLayerByName("NAME").findSequence('text').sequence.evalString(tCurrent)
+    NOTE: via python/execute, render-state (tSecElapsed/rendered text) reads 0/'';
+    only authored data + transport state are reliable (LiveUpdate doesn't have this limit).
+    A ready-made REST trigger UI (layer text OR name) is below, COMMENTED OUT —
+    search "OPTIONAL TIMELINE TRIGGER".
+
+  ★ NEWER FINDINGS (full detail in saved memory; reusable code below):
+  • LiveUpdate pushes ~20Hz / ~ms latency at updateFrequencyMs:0 (throttle to taste).
+    Nested method chains work as properties (beatToTimecode(...), noteAtBeat(findBeatOf
+    LastSection(...))). One socket per OBJECT (per transport). `player.activeLayers`
+    pushes UIDs only. Drive live clocks via LiveUpdate -> see the "LIVEUPDATE READ +
+    CLOCKS RECIPE" block and the active makeLU() / fmtTC() / SMPTE_MATH_FPS helpers.
+  • MULTI-TRANSPORT: render-state (frameNumberDisplay/tSecElapsed) only populates for
+    ONE transport at a time (internal binding, not settable). Transport STATE
+    (tCurrent/tStart/tEnd/sections/brightness) is live on ALL. SECTIONS via
+    findBeatOfLast/NextSection (times, note-independent); NOTES via findBeatOfLast/
+    NextNote (names; can sit mid-section).
+  • A plugin CAN self-create its ExpressionVariables command-bus DEVICE:
+    d3.resourceManager.loadOrCreate(d3.Path("objects/expressionvariablesdevice/<n>.apx"),
+    d3.ExpressionVariablesDevice) + devicemanager:default.devices.addItemIfNotFound(dev).
+  • Clip thumbnail (any layer, no preview window): d3.subsystems.getSystem(d3.Thumbnail
+    System).getThumbnail(file, size, 0) -> DxTexture.saveFile -> base64 (frame-0 only;
+    INTERMITTENT — parked in plugins/_ideas/).
+  • Plugin files are HTTP-served at /projects/<project>/plugins/<plugin>/ (relative URLs
+    work; base64 a PNG through python for an <img>). python/execute has an exec TIMEOUT —
+    never block with sleep loops; retry across calls.
+  • From a dev box you can hit the API directly at http://localhost/api/session/... to
+    probe fast (python/execute via curl/Invoke-RestMethod, or a WS client for LiveUpdate).
+  ---------------------------------------------------------------------------
+-->
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Plugin Template</title>
+    <!-- Window size metadata (Designer reads these) -->
+    <meta name="disguise-plugin-window-size" content="512,512">
+    <meta name="disguise-plugin-window-min-size" content="280,300">
+    <meta name="disguise-plugin-window-resizable" content="true">
+    <style>
+        /* Designer's plugin window is dark — keep text light. */
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0; padding: 16px;
+            display: flex; justify-content: center;
+            color: #fff;
+        }
+        .container { width: 360px; }
+        h1 { font-size: 20px; text-align: center; margin: 0 0 12px; }
+        button { padding: 8px 16px; font-size: 14px; cursor: pointer; }
+        .btn-row { display: flex; gap: 8px; justify-content: center; margin-bottom: 8px; flex-wrap: wrap; }
+
+        /* status line */
+        #status { margin-top: 8px; min-height: 1.2em; white-space: pre-wrap; font-size: 13px; text-align: center; }
+        #status.success { color: #4ade80; }
+        #status.error { color: #ff6b6b; }
+
+        /* readout tiles (optional) */
+        #readouts { display: flex; gap: 8px; margin: 12px 0; }
+        .readout { flex: 1; min-width: 0; border: 1px solid #ddd; border-radius: 4px; padding: 8px; text-align: center; }
+        .rd-label { font-size: 10px; color: #fff; text-transform: uppercase; letter-spacing: 0.5px; }
+        .rd-value { font-family: monospace; font-size: 18px; margin-top: 4px; white-space: nowrap; }
+        .rd-value.stale { color: #ff6b6b; }
+
+        /* form fields */
+        .field { display: flex; flex-direction: column; margin-bottom: 8px; }
+        .field label { font-size: 12px; color: #fff; margin-bottom: 2px; }
+        .field .row { display: flex; gap: 6px; }
+        .field .row input, .field .row select { flex: 1; }
+        .field input, .field select, .field textarea { font-size: 13px; font-family: monospace; padding: 4px; box-sizing: border-box; width: 100%; }
+        .hint { font-size: 11px; color: #ccc; margin-top: 2px; }
+
+        details { margin-top: 12px; font-size: 12px; }
+        summary { cursor: pointer; color: #fff; }
+
+        /* panel + trigger styles (used by the optional timeline-trigger block) */
+        .panel { border: 1px solid #ddd; border-radius: 6px; padding: 10px; margin-top: 12px; }
+        .panel h2 { font-size: 13px; margin: 0 0 8px; text-transform: uppercase; letter-spacing: 0.5px; color: #ccc; }
+        .row { display: flex; gap: 8px; align-items: center; }
+        .armed-label { font-size: 12px; cursor: pointer; }
+        .armed-label input { vertical-align: middle; margin-right: 4px; }
+        #armed-state { font-size: 12px; margin-left: auto; }
+        #armed-state.on { color: #4ade80; }
+        .rd { font-family: monospace; font-size: 12px; color: #ccc; }
+
+        /* activity log */
+        #log { margin-top: 10px; max-height: 130px; overflow-y: auto; text-align: left; font-family: monospace; font-size: 12px; border: 1px solid #ddd; border-radius: 4px; padding: 6px; }
+        #log:empty::after { content: "No activity yet."; color: #ccc; }
+        .log-entry { white-space: pre-wrap; color: #fff; }
+        .log-entry.event { color: #4ade80; font-weight: bold; }
+        .log-entry.err { color: #ff6b6b; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>Plugin Template</h1>
+
+    <!-- Example controls — replace with your own -->
+    <div class="btn-row">
+        <button onclick="testConnection()">Test connection</button>
+    </div>
+
+    <div id="status"></div>
+    <div id="log"></div>
+
+    <!-- =====================================================================
+         OPTIONAL TIMELINE TRIGGER  (bridge-free; reusable)
+         Fire an action when the disguise timeline reaches a marker — matching a
+         layer's TEXT or a layer's NAME on a chosen transport. To enable:
+           1. Uncomment THIS block.
+           2. Uncomment the matching script block (search "TIMELINE TRIGGER").
+           3. Put your action inside onTrigger() in that script block.
+           4. Uncomment `initTrigger();` in the startup handler.
+    ====================================================================== -->
+    <!--
+    <div class="panel">
+        <h2>Trigger (optional)</h2>
+        <div class="field">
+            <label for="trigger-mode">Trigger on</label>
+            <select id="trigger-mode">
+                <option value="text">Layer text</option>
+                <option value="layer">Layer name</option>
+            </select>
+        </div>
+        <div class="field">
+            <label for="transport-name">Watch transport (where the trigger layer lives)</label>
+            <input type="text" id="transport-name" spellcheck="false" placeholder="e.g. show">
+            <div class="hint">Exact transport name. Multi Transport setups have several active transports, so no auto-detect.</div>
+        </div>
+        <div class="field">
+            <label id="trigger-value-label" for="trigger-value">Fire when an active layer's text equals</label>
+            <input type="text" id="trigger-value" spellcheck="false" placeholder="e.g. go">
+            <div class="hint" id="trigger-value-hint"></div>
+        </div>
+        <div class="row">
+            <label class="armed-label"><input type="checkbox" id="stay-armed" checked> Stay armed after firing</label>
+            <span id="armed-state">Idle</span>
+        </div>
+        <div class="row" style="margin-top:8px;">
+            <button id="arm-btn" onclick="toggleArm()">Arm</button>
+            <button onclick="listActive()">List active</button>
+            <span class="rd" id="active-vals">&mdash;</span>
+        </div>
+    </div>
+    -->
+
+    <details>
+        <summary>Advanced</summary>
+        <div class="field" style="margin-top:8px;">
+            <label for="director-display">Director (from URL ?director=)</label>
+            <input type="text" id="director-display" readonly>
+        </div>
+    </details>
+</div>
+
+<script>
+    // ---------- environment ----------
+    function getDirector() {
+        const p = new URLSearchParams(window.location.search);
+        return p.get('director') || "localhost";
+    }
+    // Normalised http base for REST calls.
+    function base() {
+        const d = getDirector();
+        return (d.startsWith("http://") || d.startsWith("https://")) ? d : "http://" + d;
+    }
+
+    // ---------- UI helpers ----------
+    function setStatus(message, kind) {
+        const el = document.getElementById('status');
+        el.textContent = message || "";
+        el.className = kind || "";
+    }
+    function log(message, kind) {
+        const el = document.getElementById('log');
+        const entry = document.createElement('div');
+        entry.className = "log-entry" + (kind ? " " + kind : "");
+        entry.textContent = new Date().toLocaleTimeString() + "  " + message;
+        el.insertBefore(entry, el.firstChild);
+        while (el.childElementCount > 80) el.removeChild(el.lastChild);
+    }
+    function save(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+    function load(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } }
+
+    // ---------- Designer: run Python ----------
+    // Output channel is stdout -> response.pythonLog (NOT returnValue). Have your
+    // script PRINT one JSON line; this parses & returns it.
+    async function runScript(py) {
+        const resp = await fetch(base() + "/api/session/python/execute", {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ script: py })
+        });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok) throw new Error((data && data.status && data.status.message) || `HTTP ${resp.status}`);
+        const text = data && typeof data.pythonLog === "string" ? data.pythonLog.trim() : "";
+        if (text) { try { return JSON.parse(text); } catch (e) { return text; } }
+        return null;
+    }
+
+    // Boilerplate that exposes the expression evaluator as `_ex`.
+    const PY_EX =
+        "import json\n" +
+        "try:\n" +
+        "    _ex = Expression\n" +
+        "except NameError:\n" +
+        "    import d3\n" +
+        "    _ex = d3.Expression\n";
+
+    // Evaluate ONE disguise expression and return its value (or null on error).
+    // e.g. await evalExpr("transportmanager:default.player.tCurrent")
+    async function evalExpr(expr) {
+        const out = await runScript(
+            PY_EX +
+            "try:\n" +
+            "    _v = _ex.evaluateFromString(" + JSON.stringify(expr) + ")\n" +
+            "    try: _v = float(_v)\n" +              // numbers come back usable; comment out if you want strings
+            "    except BaseException: _v = str(_v)\n" +
+            "    print(json.dumps({'ok': True, 'value': _v}))\n" +
+            "except BaseException as e:\n" +           // evaluator errors are BaseException
+            "    print(json.dumps({'ok': False, 'error': str(e)}))");
+        if (out && out.ok) return out.value;
+        if (out && out.error) throw new Error(out.error);
+        return null;
+    }
+
+    // ---------- Designer: REST POST (e.g. transport endpoints) ----------
+    async function postJSON(path, body) {
+        const resp = await fetch(base() + path, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        const data = await resp.json().catch(() => null);
+        const okCode = data && data.status && data.status.code === 0;
+        if (!resp.ok || !okCode) throw new Error((data && data.status && data.status.message) || `HTTP ${resp.status}`);
+        return data;
+    }
+
+    // ---------- LiveUpdate (PUSH) — the preferred way to read LIVE data ----------
+    // ONE socket, ONE subscribe (many properties on one object) = the stable pattern.
+    // `properties` are python exprs relative to `object` (a disguise expr ref, e.g.
+    // "transportmanager:show"). onValue(idx,value) fires per change (~20Hz at freq 0,
+    // ~ms latency). For MULTIPLE objects (e.g. several transports) use a SEPARATE makeLU
+    // per object — many subscribes on one socket flap. Auto-reconnects. Returns
+    // { setByIndex(i,value), stop() }. (set works on settable props only.)
+    function makeLU(object, properties, freq, onValue, onStatus) {
+        let ws = null, ids = [], stopped = false, timer = null;
+        function connect() {
+            try { ws = new WebSocket("ws://" + getDirector() + "/api/session/liveupdate"); }
+            catch (e) { schedule(); return; }
+            ws.onopen = () => { ids = []; ws.send(JSON.stringify({ subscribe: { object, properties, configuration: { updateFrequencyMs: freq } } })); onStatus && onStatus(true); };
+            ws.onclose = () => { ws = null; onStatus && onStatus(false); schedule(); };
+            ws.onerror = () => {};
+            ws.onmessage = (ev) => {
+                let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+                if (m.error) { log("LiveUpdate error: " + JSON.stringify(m.error), "err"); return; }
+                if (m.subscriptions) { m.subscriptions.forEach((s, i) => { ids[i] = s.id; }); return; }
+                if (m.valuesChanged) m.valuesChanged.forEach(v => { const i = ids.indexOf(v.id); if (i >= 0 && onValue) onValue(i, v.value); });
+            };
+        }
+        function schedule() { if (!stopped && !timer) timer = setTimeout(() => { timer = null; connect(); }, 3000); }
+        connect();
+        return {
+            setByIndex(i, value) { if (ws && ws.readyState === 1 && ids[i] != null) ws.send(JSON.stringify({ set: [{ id: ids[i], value }] })); },
+            stop() { stopped = true; if (timer) clearTimeout(timer); if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} ws = null; } }
+        };
+    }
+
+    // ---------- timecode helpers ----------
+    // disguise SMPTE clock-type int -> integer fps for frame math (0=23.98 1=24 2=25
+    // 3=29.97NDF 4=29.97DF 5=30). Detect per transport via .timecode.SMPTE_clock_type.
+    const SMPTE_MATH_FPS = { 0: 24, 1: 24, 2: 25, 3: 30, 4: 30, 5: 30 };
+    // seconds -> "HH:MM:SS:FF" (rounds fps so 29.97->30). Negative -> leading "-" (countdowns).
+    function fmtTC(sec, fps) {
+        if (sec === null || sec === undefined || isNaN(sec)) return "—";
+        const neg = sec < 0; sec = Math.abs(sec); const f = Math.max(1, Math.round(fps));
+        let total = Math.round(sec * f); const fr = total % f; total = (total - fr) / f;
+        const s = total % 60; total = (total - s) / 60; const m = total % 60, h = (total - m) / 60;
+        const p2 = n => String(n).padStart(2, '0');
+        return (neg ? "-" : "") + p2(h) + ":" + p2(m) + ":" + p2(s) + ":" + p2(fr);
+    }
+
+    // ---------- example action: confirm we can reach Designer ----------
+    async function testConnection() {
+        setStatus("Pinging Designer...");
+        try {
+            const v = await evalExpr("1+1");          // evaluator sanity check
+            setStatus("Connected to Designer at " + getDirector() + " (1+1 = " + v + ").", "success");
+            log("Connection OK.", "event");
+        } catch (e) {
+            setStatus("Couldn't reach Designer: " + e.message, "error");
+            log("Connection failed: " + e.message, "err");
+        }
+    }
+
+    /* =====================================================================
+       OPTIONAL TIMELINE TRIGGER  (uncomment to enable; needs the HTML block)
+       Watches a transport's active layers and fires onTrigger() on the rising
+       edge when a layer's TEXT or NAME matches. Replace onTrigger() with your
+       action, and uncomment `initTrigger();` in the startup handler.
+    ======================================================================
+    // ---- YOUR ACTION: runs once each time the trigger matches ----
+    function onTrigger(value) {
+        setStatus("Triggered by '" + value + "'.", "success");
+        log("TRIGGER: " + value, "event");
+        // TODO: do your thing here (e.g. await reEngage(), postJSON(...), etc.)
+    }
+
+    function transportName() { return document.getElementById('transport-name').value.trim(); }
+    function triggerValue()  { return document.getElementById('trigger-value').value.trim(); }
+    function triggerMode()   { return document.getElementById('trigger-mode').value; }   // "text" | "layer"
+    function stayArmed()     { return document.getElementById('stay-armed').checked; }
+
+    function updateTriggerLabels() {
+        const isLayer = triggerMode() === "layer";
+        document.getElementById('trigger-value-label').textContent =
+            isLayer ? "Fire when an active layer is named" : "Fire when an active layer's text equals";
+        document.getElementById('trigger-value-hint').innerHTML = isLayer
+            ? "A layer with this exact name under the playhead (player.activeLayers)."
+            : "Active layers' text via findSequence('text').sequence.evalString(tCurrent).";
+    }
+
+    // Active layer TEXTS on the watch transport, at its current time.
+    async function activeLayerTexts() {
+        const T = "transportmanager:" + transportName();
+        const out = await runScript(
+            PY_EX +
+            "T = " + JSON.stringify(T) + "\n" +
+            "vals = []\n" +
+            "try:\n" +
+            "    al = list(_ex.evaluateFromString(T + '.player.activeLayers'))\n" +
+            "    tC = float(_ex.evaluateFromString(T + '.player.tCurrent'))\n" +
+            "    for x in al:\n" +
+            "        try:\n" +
+            "            v = x.findSequence('text').sequence.evalString(tC)\n" +
+            "            if v: vals.append(v)\n" +
+            "        except BaseException:\n" +
+            "            pass\n" +
+            "    print(json.dumps({'ok': True, 'vals': vals}))\n" +
+            "except BaseException as e:\n" +
+            "    print(json.dumps({'ok': False, 'error': str(e)}))");
+        if (out && out.ok) return out.vals;
+        throw new Error((out && out.error) || "no data");
+    }
+
+    // Active layer NAMES on the watch transport.
+    async function activeLayerNames() {
+        const T = "transportmanager:" + transportName();
+        const out = await runScript(
+            PY_EX +
+            "T = " + JSON.stringify(T) + "\n" +
+            "vals = []\n" +
+            "try:\n" +
+            "    al = list(_ex.evaluateFromString(T + '.player.activeLayers'))\n" +
+            "    for x in al:\n" +
+            "        r = repr(x); a = r.find(\"'\"); b = r.rfind(\"'\")\n" +
+            "        vals.append(r[a+1:b] if (a != -1 and b > a) else r)\n" +
+            "    print(json.dumps({'ok': True, 'vals': vals}))\n" +
+            "except BaseException as e:\n" +
+            "    print(json.dumps({'ok': False, 'error': str(e)}))");
+        if (out && out.ok) return out.vals;
+        throw new Error((out && out.error) || "no data");
+    }
+
+    async function activeValues() {
+        return triggerMode() === "layer" ? await activeLayerNames() : await activeLayerTexts();
+    }
+
+    async function listActive() {
+        if (!transportName()) { log("Enter the watch transport name first.", "err"); return; }
+        const kind = triggerMode() === "layer" ? "layer names" : "texts";
+        try {
+            const vals = await activeValues();
+            document.getElementById('active-vals').textContent = vals.length ? vals.map(t => '"' + t + '"').join(", ") : "(none)";
+            log("Active " + kind + ": " + (vals.length ? vals.join(" | ") : "(none)"));
+        } catch (e) { log("List active failed: " + e.message, "err"); }
+    }
+
+    let armed = false, armTimer = null, wasMatched = false;
+    const WATCH_MS = 1000;   // >= 1000ms — python/execute is main-thread
+
+    function setArmedState() {
+        const el = document.getElementById('armed-state');
+        el.textContent = armed ? "Armed" : "Idle";
+        el.className = armed ? "on" : "";
+        document.getElementById('arm-btn').textContent = armed ? "Disarm" : "Arm";
+    }
+
+    async function armTick() {
+        if (!armed) return;
+        const target = triggerValue();
+        if (!target) return;
+        try {
+            const vals = await activeValues();
+            document.getElementById('active-vals').textContent = vals.length ? vals.map(t => '"' + t + '"').join(", ") : "(none)";
+            const now = vals.indexOf(target) !== -1;
+            if (now && !wasMatched) {
+                await onTrigger(target);
+                if (!stayArmed()) { toggleArm(); return; }   // one-shot
+            }
+            wasMatched = now;
+        } catch (e) {
+            document.getElementById('active-vals').classList.add('stale');
+        }
+    }
+
+    function toggleArm() {
+        if (!armed) {
+            if (!transportName()) { setStatus("Enter the watch transport name first.", "error"); return; }
+            if (!triggerValue())  { setStatus("Enter the trigger value first.", "error"); return; }
+            armed = true; wasMatched = false;
+            armTimer = setInterval(armTick, WATCH_MS);
+            armTick();
+            setArmedState();
+            log("Armed: fire when " + triggerMode() + " '" + triggerValue() + "' is active on " + transportName() + ".", "event");
+        } else {
+            armed = false;
+            if (armTimer) { clearInterval(armTimer); armTimer = null; }
+            setArmedState();
+            log("Disarmed.");
+        }
+    }
+
+    // Call this from the startup handler to wire persistence + labels.
+    function initTrigger() {
+        const tn = document.getElementById('transport-name');
+        const tv = document.getElementById('trigger-value');
+        const md = document.getElementById('trigger-mode');
+        try {
+            const st = localStorage.getItem('trig-transport'); if (st) tn.value = st;
+            const sv = localStorage.getItem('trig-value');     if (sv) tv.value = sv;
+            const sm = localStorage.getItem('trig-mode');       if (sm) md.value = sm;
+        } catch (e) {}
+        tn.addEventListener('change', () => save('trig-transport', tn.value.trim()));
+        tv.addEventListener('change', () => save('trig-value', tv.value.trim()));
+        md.addEventListener('change', () => { save('trig-mode', md.value); wasMatched = false; updateTriggerLabels(); });
+        updateTriggerLabels();
+        setArmedState();
+    }
+    ===================================================================== */
+
+    /* =====================================================================
+       OPTIONAL LIVEUPDATE COMMAND BUS  (push; no bridge, no polling, no OSC)
+       React to "commands" written into disguise via LiveUpdate by anything —
+       e.g. Companion's "Disguise LiveUpdate" Set actions / a stream deck.
+       Uses a GLOBAL ExpressionVariables DEVICE as named command channels
+       (no layers). Pure LiveUpdate both ways.
+
+       ONE-TIME DISGUISE SETUP:
+         - Device Manager → add an ExpressionVariables device; note its name.
+         - Add Float variables to it (e.g. cmd1, cmd2…) = your command channels.
+       ENABLE:
+         1. Set LU_DEVICE + LU_CHANNELS below.
+         2. Put your logic in onCommand(name, value).
+         3. Uncomment this block AND `startCommandBus();` in the startup handler.
+       (To WRITE a channel from the plugin: subscribe an INDEX path
+        `object.container.variables[i].defaultFloat`, then send {set:[{id,value}]}
+        — by-name `next(...)` reads but isn't assignable. See the cheat sheet.)
+    ======================================================================
+       const LU_DEVICE = "expressionvariablesdevice:vardevice";  // your device's object ref
+       const LU_CHANNELS = ["cmd1", "cmd2", "cmd3"];             // your variable names
+
+       function onCommand(name, value) {
+           setStatus("Command " + name + " = " + value, "success");
+           log("CMD " + name + " = " + value, "event");
+           // TODO: branch on name/value to do your thing.
+       }
+
+       let _luWs = null, _luIdByName = {}, _luLast = {}, _luPending = [];
+       function startCommandBus() {
+           _luWs = new WebSocket("ws://" + getDirector() + "/api/session/liveupdate");
+           _luWs.onopen = () => {
+               _luPending = LU_CHANNELS.slice();
+               const props = LU_CHANNELS.map(n =>
+                   "next((v.defaultFloat for v in object.container.variables if v.name=='" + n + "'), None)");
+               _luWs.send(JSON.stringify({ subscribe: { object: LU_DEVICE, properties: props, configuration: { updateFrequencyMs: 0 } } }));
+               log("Command bus connected: " + LU_CHANNELS.join(", "), "event");
+           };
+           _luWs.onclose = () => { _luWs = null; };   // add reconnect logic if you want self-healing
+           _luWs.onerror = () => log("Command bus WS error.", "err");
+           _luWs.onmessage = (ev) => {
+               let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+               if (m.error) { log("LiveUpdate error: " + m.error, "err"); return; }
+               if (m.subscriptions) { m.subscriptions.forEach((s, i) => { if (_luPending[i]) _luIdByName[s.id] = _luPending[i]; }); return; }
+               if (m.valuesChanged) m.valuesChanged.forEach(v => {
+                   const name = _luIdByName[v.id]; if (!name) return;
+                   if (_luLast[name] !== undefined && JSON.stringify(v.value) !== JSON.stringify(_luLast[name])) onCommand(name, v.value);
+                   _luLast[name] = v.value;   // baseline on first push so it doesn't false-fire
+               });
+           };
+       }
+       ===================================================================== */
+
+    /* =====================================================================
+       LIVEUPDATE READ + CLOCKS RECIPE  (reference — the spine of every "live"
+       plugin we've built; uses the active makeLU/fmtTC helpers above)
+
+       HYBRID MODEL: LiveUpdate PUSH for everything that ticks; a slow (~1s)
+       python/execute poll for the static / list / per-section stuff; derive the
+       rest in JS from the live tCurrent.
+
+       --- LIVE values, as makeLU `properties` (object = "transportmanager:<T>") ---
+         object.player.tCurrent                                          // playhead secs (drives JS clocks)
+         object.beatToTimecode(object.track.timeToBeat(object.player.tCurrent)).__str__()   // Current Time TC string
+         object.player.playMode                                          // {state:N} (on change)
+         object.brightness                                               // transport master brightness
+         object.track.findLayerByName("LAYER").module.frameNumberDisplay // clip frame (render-state; -1 = muted OR not the bound transport)
+         object.track.findLayerByName("LAYER").module.tSecElapsed        // clip elapsed (live)
+         object.track.findLayerByName("LAYER").module.tSecRemaining      // clip remaining (live)
+         object.track.findLayerByName("LAYER").module.brightness         // layer brightness (catches keyframes)
+         object.track.noteAtBeat(object.track.findBeatOfLastSection(object.track.timeToBeat(object.player.tCurrent)))  // current section name (note at break)
+       Example wiring:
+         const G = {};
+         const fields = ['tc','timeTC'];
+         const lu = makeLU("transportmanager:show",
+           ['object.player.tCurrent','object.beatToTimecode(object.track.timeToBeat(object.player.tCurrent)).__str__()'],
+           0, (i,v)=>{ G[fields[i]] = v; render(); }, ok=>{} );
+
+       --- SLOW POLL (python) — statics + SECTION/NOTE boundaries + lists ---
+       Detect transport fps:  ct = int(t.timecode.SMPTE_clock_type) if t.timecode else int(t.smpteClockType())  -> SMPTE_MATH_FPS[ct]
+       SECTIONS (note-independent; last section ends at track end):
+         sb = tr.findBeatOfLastSection(beat); nb = tr.findBeatOfNextSection(beat)
+         secStart = tr.beatToTime(sb); secEnd = tr.beatToTime(nb)
+         name = noteAtBeat(sb) or "Section N"  (N = index where sectionToBeat(i)==sb)
+       NOTES (any note, incl. mid-section; guard no-prev/no-next):
+         lnb = tr.findBeatOfLastNote(beat); name = tr.noteAtBeat(lnb) (skip if "" or lnb>beat)
+         nnb = tr.findBeatOfNextNote(beat); name = tr.noteAtBeat(nnb) (skip if "" or nnb<=beat)
+       Playing VIDEO layers: iterate player.activeLayers, keep where
+         hasattr(x.module,'video') and 'Video' in repr(x.module); name via repr "<Layer 'NAME'>".
+       Layer extents (work on ANY transport): x.tStart / x.tEnd / x.tLength.
+       File meta: x.module.video.file.description / .codec / .resolution ; .video.fileFps / .fileNFrames / .transportDuration.
+       JS-derive off live tCurrent: layer elapsed = tCurrent - tStart; until end = tEnd - tCurrent; etc.
+
+       GOTCHAS:
+         - Render-state (frameNumberDisplay/tSecElapsed) only populates for ONE
+           transport at a time (internal binding). Layer/Section clocks work on all
+           transports; Clip clocks only on the bound one (others read -1 / 0).
+         - Clip thumbnail still (any layer, no preview window): the LIVE instance
+           ts = d3.subsystems.getSystem(d3.ThumbnailSystem);
+           tex = ts.getThumbnail(file, ts.getThumbnailSize(file), 0); tex.download(True); tex.saveFile(path)
+           -> base64 -> img.src="data:image/png;base64,...". (INTERMITTENT — see plugins/_ideas/.)
+         - Self-create a command-bus device from a plugin:
+           dev = d3.resourceManager.loadOrCreate(d3.Path("objects/expressionvariablesdevice/<name>.apx"), d3.ExpressionVariablesDevice)
+           then activate: _ex.evaluateFromString("devicemanager:default").devices.addItemIfNotFound(dev)
+           then vars: dev.container.variables.resize(N); set each [i].name/.type(0=float)/.defaultFloat.
+       ===================================================================== */
+
+    // ---------- startup ----------
+    window.addEventListener('load', () => {
+        const dd = document.getElementById('director-display');
+        if (dd) dd.value = getDirector();
+        // initTrigger();      // <- uncomment with the OPTIONAL TIMELINE TRIGGER blocks
+        // startCommandBus();  // <- uncomment with the OPTIONAL LIVEUPDATE COMMAND BUS block
+        // TODO: load saved config, populate UI, start any polling (>=1000ms!), etc.
+    });
+</script>
+</body>
+</html>
