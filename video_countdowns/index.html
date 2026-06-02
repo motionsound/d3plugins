@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<!--
+  Video Countdowns
+  ================
+  Compact countdowns for every video layer under the playhead across ALL transports,
+  plus SECTION and NOTE clocks for one picked transport.
+
+  Multi-transport notes (learned 2026-06-01):
+    - Transport STATE (tCurrent, tStart/tEnd, sections, brightness) is live on EVERY
+      transport -> the Layer method + section/note clocks work everywhere.
+    - RENDER-STATE (module.frameNumberDisplay / tSecElapsed) only populates for ONE
+      transport at a time (an internal binding we can't switch from the API). So the
+      Clip method + mute only work for the bound transport; others show "—".
+    - "muted" = frame -1 on a transport that IS rendering (some other layer renders);
+      if nothing on a transport renders, it's just not the bound one (not muted).
+
+  Hybrid: ONE LiveUpdate socket PER transport (timeTC + tCurrent + brightness + that
+  transport's video layers' render-state). A ~1s python poll lists videos across all
+  transports + statics + per-transport section/note boundaries. Top clocks use the
+  PICKED transport; each video row uses ITS OWN transport's tCurrent.
+
+  Countdown = ceil(s until end): >99 -> ▶ ; <=0 / muted / none -> — . 1-5 red, 6-15 yellow, 16+ green.
+  (Thumbnails were removed — engine thumbnail render is intermittent; recipe parked in plugins/_ideas/.)
+-->
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Video Countdowns</title>
+    <meta name="disguise-plugin-window-size" content="490,680">
+    <meta name="disguise-plugin-window-min-size" content="340,320">
+    <meta name="disguise-plugin-window-resizable" content="true">
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 10px; color: #fff; }
+        .container { max-width: 490px; margin: 0 auto; }
+        select, button { font-size: 13px; font-family: monospace; padding: 4px; }
+        .row { display: flex; gap: 8px; align-items: center; }
+        .grow { flex: 1; }
+        .dim { color: #9aa; font-size: 12px; }
+        .tc { color: #7dd3fc; }
+
+        #topxport-row { margin-bottom: 6px; }
+        .hdr { display: flex; align-items: baseline; gap: 8px; border: 1px solid #444; border-radius: 6px; padding: 5px 10px; font-size: 12px; }
+        .hdr .k { color: #9aa; } .hdr .v { font-family: monospace; }
+        .hdr .time { margin-left: auto; font-family: monospace; font-size: 13px; color: #7dd3fc; }
+        #lu-state { font-size: 11px; } #lu-state.on { color: #4ade80; } #lu-state.off { color: #ff6b6b; }
+
+        details.sec { border: 1px solid #444; border-radius: 6px; padding: 4px 10px 8px; margin-top: 8px; }
+        details.sec > summary { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: #9aa; cursor: pointer; }
+        .clockrow { display: flex; align-items: center; gap: 16px; margin-top: 6px; }
+        .ctile { min-width: 0; }
+        .ctile .cname { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .ctile .cname.cur { color: #4ade80; } .ctile .cname.nxt { color: #9aa; }
+        .ctile .ctime { font-family: monospace; font-size: 17px; color: #7dd3fc; white-space: nowrap; }
+
+        .count { margin-left: auto; font-family: monospace; font-weight: bold; font-size: 30px; line-height: 1; min-width: 1.6em; text-align: right; }
+        .count.go { color: #4ade80; } .count.warn { color: #fbbf24; } .count.crit { color: #ff5757; } .count.none { color: #555; }
+
+        .vids-head { display: flex; align-items: center; gap: 8px; margin: 12px 0 4px; }
+        .vids-head h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: #9aa; margin: 0; }
+        .vrow { display: flex; gap: 8px; align-items: stretch; border: 1px solid #3a3a3a; border-radius: 6px; padding: 6px 8px; margin-bottom: 6px; background: #161616; }
+        .vrow.inactive { opacity: .5; }
+        .vbody { flex: 1; min-width: 0; }
+        .vrow-top { display: flex; align-items: center; gap: 8px; }
+        .vtag { font-size: 9px; text-transform: uppercase; letter-spacing: .5px; color: #9aa; background: #2a2a2a; border-radius: 3px; padding: 1px 5px; }
+        .vname { font-weight: bold; font-size: 14px; }
+        .badge { font-size: 10px; padding: 1px 5px; border-radius: 3px; white-space: nowrap; }
+        .badge.on { background: #14532d; color: #4ade80; } .badge.off { background: #4c1d1d; color: #ff6b6b; }
+        .vrow-clocks { display: flex; gap: 14px; font-size: 12px; margin-top: 2px; }
+        .vrow-clocks .lab { color: #9aa; } .vrow-clocks .val { font-family: monospace; color: #7dd3fc; }
+        details.vdetails { margin-top: 4px; }
+        details.vdetails > summary { font-size: 11px; color: #9aa; cursor: pointer; }
+        .vdetails .kv { display: grid; grid-template-columns: auto 1fr; gap: 1px 10px; font-size: 12px; margin-top: 4px; }
+        .vdetails .kv .k { color: #9aa; white-space: nowrap; } .vdetails .kv .v { font-family: monospace; word-break: break-word; }
+
+        #status { min-height: 1em; font-size: 12px; text-align: center; margin: 4px 0; }
+        #status.error { color: #ff6b6b; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div id="topblock">
+    <div id="topxport-row" class="row" style="display:none;">
+        <span class="dim">Clocks for</span>
+        <select id="topxport" class="grow"></select>
+        <button onclick="refreshAll()" title="Refresh">↻</button>
+    </div>
+
+    <div class="hdr">
+        <span class="k">Track</span> <span class="v" id="h-track">—</span>
+        <span class="k" style="margin-left:10px;">Mode</span> <span class="v" id="h-playmode">—</span>
+        <span class="time" id="h-time">—</span>
+        <span id="lu-state" class="off">●</span>
+    </div>
+
+    <details class="sec" id="sec-section" open>
+        <summary>Section clocks</summary>
+        <div class="clockrow">
+            <div class="ctile"><div class="cname cur" id="sec-curname">—</div><div class="ctime" id="sec-since">—</div></div>
+            <div class="ctile"><div class="cname nxt" id="sec-untilname">—</div><div class="ctime" id="sec-until">—</div></div>
+            <span class="count none" id="sec-count">—</span>
+        </div>
+    </details>
+
+    <details class="sec" id="sec-note">
+        <summary>Note clocks</summary>
+        <div class="clockrow">
+            <div class="ctile"><div class="cname cur" id="note-curname">—</div><div class="ctime" id="note-since">—</div></div>
+            <div class="ctile"><div class="cname nxt" id="note-untilname">—</div><div class="ctime" id="note-until">—</div></div>
+            <span class="count none" id="note-count">—</span>
+        </div>
+    </details>
+    </div>
+
+    <div class="vids-head">
+        <h2>Videos</h2>
+        <label style="margin-left:auto; font-size:12px; cursor:pointer; color:#9aa;"><input type="checkbox" id="txclocks"> clocks</label>
+        <label style="font-size:12px; cursor:pointer; color:#9aa;"><input type="checkbox" id="sort"> sort ↕</label>
+        <select id="method">
+            <option value="clip">Clip</option>
+            <option value="layer">Layer</option>
+        </select>
+    </div>
+    <div id="videos"></div>
+
+    <div id="hide-row" class="row" style="flex-wrap:wrap; gap:12px; margin-top:6px; display:none;"></div>
+    <div id="status"></div>
+</div>
+
+<script>
+    // ---------- plumbing ----------
+    function getDirector() { const p = new URLSearchParams(window.location.search); return p.get('director') || "localhost"; }
+    function base() { const d = getDirector(); return (d.startsWith("http") ? d : "http://" + d); }
+    function setStatus(m, k) { const el = document.getElementById('status'); el.textContent = m || ""; el.className = k || ""; }
+    function save(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+    function load(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } }
+    async function runScript(py) {
+        const resp = await fetch(base() + "/api/session/python/execute", { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ script: py }) });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok) throw new Error((data && data.status && data.status.message) || `HTTP ${resp.status}`);
+        const t = data && typeof data.pythonLog === "string" ? data.pythonLog.trim() : "";
+        if (t) { try { return JSON.parse(t); } catch (e) { return t; } }
+        return null;
+    }
+    const PY_EX = "import json\ntry:\n    _ex = Expression\nexcept NameError:\n    import d3\n    _ex = d3.Expression\n";
+
+    // ---------- formatting ----------
+    const SMPTE_MATH_FPS = { 0: 24, 1: 24, 2: 25, 3: 30, 4: 30, 5: 30 };
+    function fmtTC(sec, fps) {
+        if (sec === null || sec === undefined || isNaN(sec)) return "—";
+        const neg = sec < 0; sec = Math.abs(sec);
+        const f = Math.max(1, Math.round(fps));
+        let total = Math.round(sec * f);
+        const fr = total % f; total = (total - fr) / f;
+        const s = total % 60; total = (total - s) / 60;
+        const m = total % 60; const h = (total - m) / 60;
+        const p2 = n => String(n).padStart(2, '0');
+        return (neg ? "-" : "") + p2(h) + ":" + p2(m) + ":" + p2(s) + ":" + p2(fr);
+    }
+    function parseVec2(s) { const m = String(s).match(/Vec2\(([\d.]+),\s*([\d.]+)\)/); return m ? Math.round(+m[1]) + "×" + Math.round(+m[2]) : String(s); }
+    function atEndLabel(n) { return ({ 0: "Loop", 1: "Ping-Pong", 2: "Once" })[n] || ("?(" + n + ")"); }
+    function countdown(cd, muted) {
+        if (muted || cd == null || isNaN(cd) || cd <= 0) return { t: "—", cls: "none" };
+        if (cd > 99) return { t: "▶", cls: "go" };
+        const n = Math.ceil(cd);
+        return { t: String(n), cls: n <= 5 ? "crit" : n <= 15 ? "warn" : "go" };
+    }
+    function setCount(id, cd, muted) { const el = document.getElementById(id), c = countdown(cd, muted); el.textContent = c.t; el.className = "count " + c.cls; }
+    function lk(t, n) { return t + "|" + n; }   // layer key (transport + name; names can collide across transports)
+
+    // ---------- state ----------
+    let transportsList = [];     // [{name, track}]
+    let G = {};                  // { transportName: {timeTC, tCurrent, transportBrightness} }
+    let PL = {};                 // { layerKey: {clipFrame,clipElapsed,clipRemain,brightness} }
+    let M = { transports: {}, videos: [], statics: {} };
+    let method = load('vc-method', 'layer'); if (method === 'section') method = 'layer';   // default Layer (Clip is the rarer case)
+    // one muted colour per transport (by order; ≤4 transports expected)
+    const XPORT_COLORS = ["#c2d6ff", "#ebc2ff", "#ffccc2", "#C2FFCC"];   // blue, purple, salmon, green (green last — avoid Active-green confusion)
+    let xportColor = {};
+    let hiddenXports = new Set();   // transports whose rows are hidden via the bottom checkboxes
+
+    function topXport() { const s = document.getElementById('topxport'); return s.value || (transportsList[0] && transportsList[0].name) || ""; }
+
+    // ---------- transports (REST) ----------
+    async function loadTransports() {
+        let list = [];
+        try { const r = await fetch(base() + "/api/session/transport/transports").then(x => x.json()); list = (r && r.transports) || []; }
+        catch (e) { setStatus("Couldn't load transports: " + e.message, "error"); }
+        transportsList = list.map(t => ({ name: t.name, track: (t.currentTrack && t.currentTrack.name) || "" }));
+        xportColor = {}; transportsList.forEach((t, i) => { xportColor[t.name] = XPORT_COLORS[i % XPORT_COLORS.length]; });
+        const sel = document.getElementById('topxport');
+        let want = sel.value || load('vc-topxport', "");
+        sel.replaceChildren();
+        transportsList.forEach(t => { const o = document.createElement('option'); o.value = t.name; o.textContent = t.name; sel.appendChild(o); });
+        if (want && [...sel.options].some(o => o.value === want)) sel.value = want;
+        else if (transportsList.length) sel.value = transportsList[0].name;
+        document.getElementById('topxport-row').style.display = (transportsList.length > 1) ? "" : "none";
+        buildHideToggles();
+    }
+    // Bottom "Hide <transport>" checkboxes (only with >1 transport) — hide all rows of a
+    // transport. Coloured to match the transport's tag. Persisted.
+    function buildHideToggles() {
+        const host = document.getElementById('hide-row');
+        host.replaceChildren(); hiddenXports = new Set();
+        if (transportsList.length <= 1) { host.style.display = "none"; return; }
+        host.style.display = "";
+        transportsList.forEach(t => {
+            const saved = load('vc-hide-' + t.name, "0") === "1";
+            if (saved) hiddenXports.add(t.name);
+            const lbl = document.createElement('label');
+            lbl.style.cssText = "font-size:12px; cursor:pointer; color:" + (xportColor[t.name] || "#9aa") + ";";
+            const cb = document.createElement('input'); cb.type = "checkbox"; cb.checked = saved;
+            cb.addEventListener('change', () => {
+                if (cb.checked) hiddenXports.add(t.name); else hiddenXports.delete(t.name);
+                save('vc-hide-' + t.name, cb.checked ? "1" : "0"); scheduleRender();
+            });
+            lbl.appendChild(cb); lbl.appendChild(document.createTextNode(" Hide " + t.name));
+            host.appendChild(lbl);
+        });
+    }
+    function trackOf(name) { const t = transportsList.find(x => x.name === name); return t ? t.track : ""; }
+    function refreshAll() { loadTransports().then(() => { pollMeta(); }); }
+
+    // ---------- LiveUpdate: one socket per transport ----------
+    function makeLU(object, properties, freq, onValue, onStatus) {
+        let ws = null, ids = [], stopped = false, timer = null;
+        function connect() {
+            try { ws = new WebSocket("ws://" + getDirector() + "/api/session/liveupdate"); }
+            catch (e) { schedule(); return; }
+            ws.onopen = () => { ids = []; ws.send(JSON.stringify({ subscribe: { object: object, properties: properties, configuration: { updateFrequencyMs: freq } } })); onStatus && onStatus(true); };
+            ws.onclose = () => { ws = null; onStatus && onStatus(false); schedule(); };
+            ws.onerror = () => {};
+            ws.onmessage = (ev) => {
+                let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+                if (m.error) { return; }
+                if (m.subscriptions) { m.subscriptions.forEach((s, i) => { ids[i] = s.id; }); return; }
+                if (m.valuesChanged) m.valuesChanged.forEach(v => { const idx = ids.indexOf(v.id); if (idx >= 0 && onValue) onValue(idx, v.value); });
+            };
+        }
+        function schedule() { if (!stopped && !timer) timer = setTimeout(() => { timer = null; connect(); }, 3000); }
+        connect();
+        return { stop() { stopped = true; if (timer) clearTimeout(timer); if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} ws = null; } } };
+    }
+    function buildLivePropsFor(tn, layers) {
+        const props = [], desc = [];
+        const add = (d, e) => { desc.push(d); props.push(e); };
+        add({ g: 'timeTC' }, 'object.beatToTimecode(object.track.timeToBeat(object.player.tCurrent)).__str__()');
+        add({ g: 'tCurrent' }, 'object.player.tCurrent');
+        add({ g: 'transportBrightness' }, 'object.brightness');
+        layers.forEach(n => {
+            const ML = 'object.track.findLayerByName("' + n + '").module', k = lk(tn, n);
+            add({ k, f: 'clipFrame' }, ML + '.frameNumberDisplay');
+            add({ k, f: 'clipElapsed' }, ML + '.tSecElapsed');
+            add({ k, f: 'clipRemain' }, ML + '.tSecRemaining');
+            add({ k, f: 'brightness' }, ML + '.brightness');
+        });
+        return { props, desc };
+    }
+    let luConns = {}, luLayerSets = {}, luOk = {};
+    function updateLuDot() {
+        const need = Object.keys(luConns);
+        const ok = need.length > 0 && need.every(t => luOk[t]);
+        const el = document.getElementById('lu-state'); el.className = ok ? "on" : "off"; el.title = "LiveUpdate " + (ok ? "connected" : "…");
+    }
+    function reconcileLU() {
+        const byT = {};
+        (M.videos || []).forEach(v => { (byT[v.t] = byT[v.t] || []).push(v.n); });
+        const need = new Set(Object.keys(byT));
+        if (topXport()) need.add(topXport());     // the picked transport needs a socket for the top clocks
+        // tear down sockets no longer needed
+        for (const tn in luConns) { if (!need.has(tn)) { luConns[tn].stop(); delete luConns[tn]; delete luLayerSets[tn]; delete luOk[tn]; } }
+        // create / update
+        need.forEach(tn => {
+            const layers = (byT[tn] || []).slice().sort(), key = layers.join(",");
+            if (luConns[tn] && luLayerSets[tn] === key) return;     // unchanged
+            if (luConns[tn]) { luConns[tn].stop(); delete luConns[tn]; }
+            luLayerSets[tn] = key; luOk[tn] = false;
+            const { props, desc } = buildLivePropsFor(tn, layers);
+            luConns[tn] = makeLU("transportmanager:" + tn, props, 0,
+                (idx, val) => { const d = desc[idx]; if (!d) return; if (d.g) (G[tn] = G[tn] || {})[d.g] = val; else (PL[d.k] = PL[d.k] || {})[d.f] = val; scheduleRender(); },
+                ok => { luOk[tn] = ok; updateLuDot(); });
+        });
+        updateLuDot();
+    }
+
+    // ---------- slow poll (all transports) ----------
+    function pollScript(names) {
+        return PY_EX +
+            "names = " + JSON.stringify(names) + "\n" +
+            "o = {'transports': {}, 'videos': [], 'statics': {}}\n" +
+            "for tn in names:\n" +
+            "    try:\n" +
+            "        t = _ex.evaluateFromString('transportmanager:' + tn); tr = t.track; p = t.player\n" +
+            "        tc = float(p.tCurrent); beat = tr.timeToBeat(tc)\n" +
+            "        td = {}\n" +
+            "        td['playMode'] = str(p.playMode)\n" +
+            "        try:\n" +
+            "            d2 = t.timecode; td['smpteCt'] = int(d2.SMPTE_clock_type) if d2 is not None else int(t.smpteClockType())\n" +
+            "        except BaseException: td['smpteCt'] = 5\n" +
+            "        try:\n" +
+            "            sb = tr.findBeatOfLastSection(beat); nb = tr.findBeatOfNextSection(beat)\n" +
+            "            td['secStart']=float(tr.beatToTime(sb)); td['secEnd']=float(tr.beatToTime(nb))\n" +
+            "            ns = int(tr.nSections()); idx = 0\n" +
+            "            for i in range(ns):\n" +
+            "                if abs(float(tr.sectionToBeat(i)) - float(sb)) < 0.01: idx = i; break\n" +
+            "            cn = str(tr.noteAtBeat(sb)); td['curSecName'] = cn if cn else ('Section ' + str(idx))\n" +
+            "            nn = str(tr.noteAtBeat(nb)); td['nextSecName'] = nn if nn else (('Section ' + str(idx+1)) if (idx+1) < ns else 'End')\n" +
+            "        except BaseException:\n" +
+            "            td['secStart']=None; td['secEnd']=None\n" +
+            "        try:\n" +
+            "            lnb = tr.findBeatOfLastNote(beat); lnn = str(tr.noteAtBeat(lnb))\n" +
+            "            if lnn and float(lnb) <= beat: td['lastNoteTime']=float(tr.beatToTime(lnb)); td['lastNoteName']=lnn\n" +
+            "            else: td['lastNoteTime']=None; td['lastNoteName']=''\n" +
+            "        except BaseException: td['lastNoteTime']=None; td['lastNoteName']=''\n" +
+            "        try:\n" +
+            "            nnb = tr.findBeatOfNextNote(beat); nnn = str(tr.noteAtBeat(nnb))\n" +
+            "            if nnn and float(nnb) > beat: td['nextNoteTime']=float(tr.beatToTime(nnb)); td['nextNoteName']=nnn\n" +
+            "            else: td['nextNoteTime']=None; td['nextNoteName']=''\n" +
+            "        except BaseException: td['nextNoteTime']=None; td['nextNoteName']=''\n" +
+            "        o['transports'][tn] = td\n" +
+            "        for x in list(p.activeLayers):\n" +
+            "            try:\n" +
+            "                mod = x.module\n" +
+            "                if hasattr(mod, 'video') and ('Video' in repr(mod)):\n" +
+            "                    r = repr(x); a = r.find(\"'\"); b = r.rfind(\"'\")\n" +
+            "                    nm = r[a+1:b] if (a!=-1 and b>a) else r\n" +
+            "                    o['videos'].append({'t': tn, 'n': nm})\n" +
+            "                    key = tn + '|' + nm\n" +
+            "                    s = {}\n" +
+            "                    try: s['tStart']=float(x.tStart); s['tEnd']=float(x.tEnd)\n" +
+            "                    except BaseException: pass\n" +
+            "                    try: s['fps']=float(mod.video.fileFps)\n" +
+            "                    except BaseException: s['fps']=None\n" +
+            "                    try: s['clipNFrames']=int(mod.clipNFrames)\n" +
+            "                    except BaseException: pass\n" +
+            "                    try: s['file']=str(mod.video.file.description)\n" +
+            "                    except BaseException: pass\n" +
+            "                    try: s['res']=str(mod.video.file.resolution)\n" +
+            "                    except BaseException: pass\n" +
+            "                    try: s['codec']=str(mod.video.file.codec)\n" +
+            "                    except BaseException: pass\n" +
+            "                    try: s['duration']=str(mod.video.transportDuration)\n" +
+            "                    except BaseException: pass\n" +
+            "                    try: s['frames']=int(mod.video.fileNFrames)\n" +
+            "                    except BaseException: pass\n" +
+            "                    try: s['mapping']=str(mod.mapping.description)\n" +
+            "                    except BaseException: pass\n" +
+            "                    try: s['atEnd']=int(mod.at_end_point)\n" +
+            "                    except BaseException: pass\n" +
+            "                    try: s['mode']=int(mod.mode)\n" +
+            "                    except BaseException: pass\n" +
+            "                    o['statics'][key] = s\n" +
+            "            except BaseException: pass\n" +
+            "    except BaseException: pass\n" +
+            "print(json.dumps({'ok': True, 'data': o}))\n";
+    }
+    let pollingMeta = false, lastVideoKey = "";
+    async function pollMeta() {
+        if (!transportsList.length) { setStatus("No transports.", ""); return; }
+        if (pollingMeta) return; pollingMeta = true;
+        try {
+            const out = await runScript(pollScript(transportsList.map(t => t.name)));
+            if (out && out.ok) {
+                setStatus("");
+                M = out.data || { transports: {}, videos: [], statics: {} };
+                // statics keyed "t|n" in python -> re-key with our lk()
+                const sx = {}; for (const k in M.statics) { const i = k.indexOf("|"); sx[lk(k.slice(0, i), k.slice(i + 1))] = M.statics[k]; } M.statics = sx;
+                const vkey = (M.videos || []).map(v => v.t + "|" + v.n).sort().join(",");
+                if (vkey !== lastVideoKey) { lastVideoKey = vkey; rebuildRows(M.videos || []); reconcileLU(); }
+                scheduleRender();
+            } else setStatus("Designer error: " + (out && out.error), "error");
+        } catch (e) { setStatus("Poll failed: " + e.message, "error"); }
+        finally { pollingMeta = false; }
+    }
+
+    // ---------- video rows ----------
+    let rows = {};   // layerKey -> {el, t, n, els}
+    function rebuildRows(videos) {
+        const host = document.getElementById('videos');
+        host.replaceChildren(); rows = {};
+        const showTag = transportsList.length > 1;
+        videos.forEach(v => {
+            const key = lk(v.t, v.n);
+            const el = document.createElement('div'); el.className = 'vrow'; el.__key = key;
+            el.innerHTML =
+                '<div class="vbody">' +
+                '<div class="vrow-top">' + (showTag ? '<span class="vtag"></span> ' : '') + '<span class="vname"></span> <span class="vactive badge"></span> <span class="count none vcount"></span></div>' +
+                '<div class="vrow-clocks"><span class="lab l1l"></span> <span class="val l1v"></span> <span class="lab l2l"></span> <span class="val l2v"></span></div>' +
+                '<details class="vdetails"><summary>Details</summary><div class="kv">' +
+                '<div class="k">File</div><div class="v d-file"></div>' +
+                '<div class="k">FPS·Res·Codec</div><div class="v d-meta"></div>' +
+                '<div class="k">Duration</div><div class="v d-dur"></div>' +
+                '<div class="k">Mapping</div><div class="v d-map"></div>' +
+                '<div class="k">At end</div><div class="v d-end"></div>' +
+                '</div></details></div>';
+            host.appendChild(el);
+            const q = s => el.querySelector(s);
+            rows[key] = { el, t: v.t, n: v.n, els: { tag: q('.vtag'), name: q('.vname'), active: q('.vactive'), count: q('.vcount'), l1l: q('.l1l'), l1v: q('.l1v'), l2l: q('.l2l'), l2v: q('.l2v'), file: q('.d-file'), meta: q('.d-meta'), dur: q('.d-dur'), map: q('.d-map'), end: q('.d-end') } };
+            rows[key].els.name.textContent = v.n;
+            if (rows[key].els.tag) { rows[key].els.tag.textContent = v.t; rows[key].els.tag.style.background = xportColor[v.t] || "#2a2a2a"; rows[key].els.tag.style.color = xportColor[v.t] ? "#111" : "#9aa"; }
+        });
+    }
+    function layerView(key) {
+        const r = rows[key], lv = PL[key] || {}, st = M.statics[key] || {}, mt = M.transports[r.t] || {}, gt = G[r.t] || {};
+        const tc = (typeof gt.tCurrent === 'number') ? gt.tCurrent : null;
+        const ffps = st.fps || 30, tfps = SMPTE_MATH_FPS[mt.smpteCt] || 30;
+        const frame = (typeof lv.clipFrame === 'number') ? Math.round(lv.clipFrame) : null;
+        const rendering = (frame != null && frame >= 0);
+        let l1l, l1v, l2l, l2v, cd;
+        if (method === 'layer') {
+            l1l = 'Layer'; l2l = 'Until end';
+            const le = (tc !== null && st.tStart != null) ? tc - st.tStart : null;
+            const lr = (tc !== null && st.tEnd != null) ? st.tEnd - tc : null;
+            l1v = le != null ? fmtTC(le, tfps) : null; l2v = lr != null ? fmtTC(lr, tfps) : null; cd = lr;
+        } else {
+            l1l = 'Clip'; l2l = 'Until end';
+            l1v = (rendering && typeof lv.clipElapsed === 'number') ? fmtTC(lv.clipElapsed, ffps) : null;
+            l2v = (rendering && typeof lv.clipRemain === 'number') ? fmtTC(lv.clipRemain, ffps) : null;
+            cd = rendering ? lv.clipRemain : null;
+        }
+        return { l1l, l1v, l2l, l2v, cd, frame, rendering, brightness: lv.brightness, t: r.t };
+    }
+    function statusOf(v, muted) {
+        if (muted) return { t: "MUTED", ok: false };
+        const gt = G[v.t] || {};
+        if (gt.transportBrightness != null && gt.transportBrightness <= 0) return { t: "INACTIVE — TRANSPORT BRIGHTNESS 0", ok: false };
+        if (v.brightness != null && v.brightness <= 0) return { t: "INACTIVE — BRIGHTNESS 0", ok: false };
+        if (v.brightness === undefined) return { t: "…", ok: true };
+        return { t: "ACTIVE", ok: true };
+    }
+
+    // ---------- render ----------
+    let rafPending = false;
+    function scheduleRender() { if (!rafPending) { rafPending = true; requestAnimationFrame(() => { rafPending = false; render(); }); } }
+    function render() {
+        // top clocks for the picked transport
+        const T = topXport(), gsel = G[T] || {}, msel = M.transports[T] || {};
+        const tfps = SMPTE_MATH_FPS[msel.smpteCt] || 30, tcs = (typeof gsel.tCurrent === 'number') ? gsel.tCurrent : null;
+        document.getElementById('h-track').textContent = trackOf(T) || "—";
+        document.getElementById('h-playmode').textContent = msel.playMode || "—";
+        document.getElementById('h-time').textContent = gsel.timeTC || "—";
+        document.getElementById('sec-curname').textContent = msel.curSecName || "—";
+        document.getElementById('sec-untilname').textContent = msel.nextSecName ? ("UNTIL " + msel.nextSecName) : "—";
+        document.getElementById('sec-since').textContent = (tcs !== null && msel.secStart != null) ? fmtTC(tcs - msel.secStart, tfps) : "—";
+        document.getElementById('sec-until').textContent = (tcs !== null && msel.secEnd != null) ? fmtTC(msel.secEnd - tcs, tfps) : "—";
+        setCount('sec-count', (tcs !== null && msel.secEnd != null) ? msel.secEnd - tcs : null, false);
+        document.getElementById('note-curname').textContent = msel.lastNoteName || "(no note yet)";
+        document.getElementById('note-untilname').textContent = msel.nextNoteName ? ("UNTIL " + msel.nextNoteName) : "(no next note)";
+        document.getElementById('note-since').textContent = (tcs !== null && msel.lastNoteTime != null) ? fmtTC(tcs - msel.lastNoteTime, tfps) : "—";
+        document.getElementById('note-until').textContent = (tcs !== null && msel.nextNoteTime != null) ? fmtTC(msel.nextNoteTime - tcs, tfps) : "—";
+        setCount('note-count', (tcs !== null && msel.nextNoteTime != null) ? msel.nextNoteTime - tcs : null, false);
+
+        // videos (all transports)
+        const views = {};
+        for (const key in rows) views[key] = layerView(key);
+        // per-transport: is any layer rendering? (to tell mute from non-bound transport)
+        const renderingByT = {};
+        for (const key in views) { const v = views[key]; if (v.rendering) renderingByT[v.t] = true; }
+        for (const key in rows) {
+            const r = rows[key], v = views[key], st = M.statics[key] || {};
+            r.el.style.display = hiddenXports.has(r.t) ? "none" : "";   // bottom Hide-transport toggle
+            v.muted = (v.frame === -1) && !!renderingByT[v.t];
+            const s = statusOf(v, v.muted);
+            r.el.classList.toggle('inactive', !s.ok);
+            r.els.active.textContent = s.t; r.els.active.className = "vactive badge " + (s.ok ? "on" : "off");
+            r.els.l1l.textContent = v.l1l; r.els.l1v.textContent = v.l1v || "—";
+            r.els.l2l.textContent = v.l2l; r.els.l2v.textContent = v.l2v || "—";
+            const c = countdown(v.cd, v.muted); r.els.count.textContent = c.t; r.els.count.className = "count vcount " + c.cls;
+            r.els.file.textContent = st.file || "—";
+            const fpsTxt = st.fps ? ((st.fps % 1 === 0 ? st.fps : Math.round(st.fps * 100) / 100) + "fps") : "";
+            r.els.meta.textContent = [fpsTxt, parseVec2(st.res), st.codec].filter(Boolean).join(" · ") || "—";
+            r.els.dur.textContent = (st.duration || "—") + (st.frames != null ? "  (" + st.frames + " fr)" : "");
+            r.els.map.textContent = st.mapping || "—";
+            r.els.end.textContent = (st.atEnd != null ? atEndLabel(st.atEnd) : "—") + (st.mode != null ? "  / mode " + st.mode : "");
+        }
+        if (sortOn()) reorderVideos(views);
+    }
+    function sortOn() { const el = document.getElementById('sort'); return el && el.checked; }
+    function sortKey(v) { return (v.muted || v.cd == null || isNaN(v.cd) || v.cd <= 0) ? Infinity : v.cd; }
+    function reorderVideos(views) {
+        const host = document.getElementById('videos');
+        const order = Object.keys(rows).sort((a, b) => sortKey(views[a]) - sortKey(views[b]));
+        const cur = [...host.children].map(el => el.__key);
+        if (order.length === cur.length && order.every((n, i) => n === cur[i])) return;
+        order.forEach(k => host.appendChild(rows[k].el));
+    }
+
+    // ---------- init ----------
+    const POLL_MS = 1000;
+    window.addEventListener('load', async () => {
+        document.getElementById('method').value = method;
+        document.getElementById('method').addEventListener('change', e => { method = e.target.value; save('vc-method', method); render(); });
+        document.getElementById('sort').checked = load('vc-sort', "1") === "1";
+        document.getElementById('sort').addEventListener('change', e => { save('vc-sort', e.target.checked ? "1" : "0"); render(); });
+        document.getElementById('topxport').addEventListener('change', e => { save('vc-topxport', e.target.value); reconcileLU(); render(); });
+        const applyTxClocks = () => { document.getElementById('topblock').style.display = document.getElementById('txclocks').checked ? "" : "none"; };
+        document.getElementById('txclocks').checked = load('vc-txclocks', "1") === "1";
+        applyTxClocks();
+        document.getElementById('txclocks').addEventListener('change', e => { save('vc-txclocks', e.target.checked ? "1" : "0"); applyTxClocks(); });
+        document.querySelectorAll('details.sec').forEach(d => {
+            const k = 'vc-open-' + d.id, saved = load(k, null);
+            if (saved !== null) d.open = (saved === "1");
+            d.addEventListener('toggle', () => save(k, d.open ? "1" : "0"));
+        });
+        await loadTransports();
+        await pollMeta();
+        setInterval(pollMeta, POLL_MS);
+    });
+</script>
+</body>
+</html>

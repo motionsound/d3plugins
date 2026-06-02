@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<!--
+  Multi Transport Clocks
+  ======================
+  Section clocks + Note clocks for EVERY transport, stacked. Companion to Video
+  Countdowns (turn off that plugin's "clocks" to avoid duplication and watch all
+  transports' timing here at once).
+
+  Per transport block: Current Time, then
+    SECTION:  <current section name> +<time since break>   UNTIL <next section> -<until break>   [countdown]
+    NOTE:     <previous note>        +<time since note>     UNTIL <next note>     -<until note>     [countdown]
+  Section boundaries come from SECTIONS (note-independent; findBeatOfLastSection/
+  findBeatOfNextSection — last section ends at the track end). A note AT a break is
+  that section's name; an unnamed break is auto-numbered "Section N". Note clocks
+  track ANY note (incl. mid-section).
+
+  Hybrid: ONE LiveUpdate socket per transport (timeTC + tCurrent, ~20Hz). A ~1s python
+  poll provides per-transport section/note boundary names+times. since/until clocks +
+  countdowns are JS-derived off the live tCurrent. (See LiveUpdate classification + the
+  section-vs-note notes in memory.)
+-->
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Multi Transport Clocks</title>
+    <meta name="disguise-plugin-window-size" content="470,560">
+    <meta name="disguise-plugin-window-min-size" content="340,200">
+    <meta name="disguise-plugin-window-resizable" content="true">
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 10px; color: #fff; }
+        .container { max-width: 470px; margin: 0 auto; }
+        button { font-size: 13px; cursor: pointer; padding: 4px 8px; }
+        .topbar { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+        .topbar h1 { font-size: 14px; margin: 0; color: #ccc; }
+        #lu-state { font-size: 11px; margin-left: auto; } #lu-state.on { color: #4ade80; } #lu-state.off { color: #ff6b6b; }
+        .dim { color: #9aa; } .tc { color: #7dd3fc; }
+
+        .txblock { border: 1px solid #3a3a3a; border-radius: 6px; padding: 6px 10px; margin-bottom: 8px; background: #161616; }
+        .txhead { display: flex; align-items: baseline; gap: 8px; font-size: 12px; }
+        .txname { font-weight: bold; font-size: 14px; }
+        .txtrack { font-size: 11px; }
+        .txtime { margin-left: auto; font-family: monospace; font-size: 14px; }
+
+        .clockrow { display: flex; align-items: center; gap: 12px; margin-top: 5px; }
+        .rlab { font-size: 9px; color: #9aa; width: 30px; }
+        .ctile { min-width: 0; flex: 1; }
+        .ctile .cname { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .ctile .cname.cur { color: #4ade80; } .ctile .cname.nxt { color: #9aa; }
+        .ctile .ctime { font-family: monospace; font-size: 16px; color: #7dd3fc; white-space: nowrap; }
+        .count { font-family: monospace; font-weight: bold; font-size: 26px; line-height: 1; min-width: 1.6em; text-align: right; }
+        .count.go { color: #4ade80; } .count.warn { color: #fbbf24; } .count.crit { color: #ff5757; } .count.none { color: #555; }
+
+        #status { min-height: 1em; font-size: 12px; text-align: center; margin: 4px 0; }
+        #status.error { color: #ff6b6b; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <h1>Transport Clocks</h1>
+        <button onclick="refreshAll()" title="Refresh transports">↻</button>
+        <span id="lu-state" class="off">●</span>
+    </div>
+    <div id="blocks"></div>
+    <div id="status"></div>
+</div>
+
+<script>
+    // ---------- plumbing ----------
+    function getDirector() { const p = new URLSearchParams(window.location.search); return p.get('director') || "localhost"; }
+    function base() { const d = getDirector(); return (d.startsWith("http") ? d : "http://" + d); }
+    function setStatus(m, k) { const el = document.getElementById('status'); el.textContent = m || ""; el.className = k || ""; }
+    async function runScript(py) {
+        const resp = await fetch(base() + "/api/session/python/execute", { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ script: py }) });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok) throw new Error((data && data.status && data.status.message) || `HTTP ${resp.status}`);
+        const t = data && typeof data.pythonLog === "string" ? data.pythonLog.trim() : "";
+        if (t) { try { return JSON.parse(t); } catch (e) { return t; } }
+        return null;
+    }
+    const PY_EX = "import json\ntry:\n    _ex = Expression\nexcept NameError:\n    import d3\n    _ex = d3.Expression\n";
+
+    // ---------- formatting ----------
+    const SMPTE_MATH_FPS = { 0: 24, 1: 24, 2: 25, 3: 30, 4: 30, 5: 30 };
+    function fmtTC(sec, fps) {
+        if (sec === null || sec === undefined || isNaN(sec)) return "—";
+        const neg = sec < 0; sec = Math.abs(sec);
+        const f = Math.max(1, Math.round(fps));
+        let total = Math.round(sec * f);
+        const fr = total % f; total = (total - fr) / f;
+        const s = total % 60; total = (total - s) / 60;
+        const m = total % 60; const h = (total - m) / 60;
+        const p2 = n => String(n).padStart(2, '0');
+        return (neg ? "-" : "") + p2(h) + ":" + p2(m) + ":" + p2(s) + ":" + p2(fr);
+    }
+    function countdown(cd) {
+        if (cd == null || isNaN(cd) || cd <= 0) return { t: "—", cls: "none" };
+        if (cd > 99) return { t: "▶", cls: "go" };
+        const n = Math.ceil(cd);
+        return { t: String(n), cls: n <= 5 ? "crit" : n <= 15 ? "warn" : "go" };
+    }
+
+    // ---------- state ----------
+    let transportsList = [];     // [{name, track}]
+    let G = {};                  // { name: {timeTC, tCurrent} }
+    let M = { transports: {} };  // { name: {playMode,smpteCt, sec/note boundaries} }
+
+    // ---------- transports + per-transport LiveUpdate ----------
+    async function loadTransports() {
+        let list = [];
+        try { const r = await fetch(base() + "/api/session/transport/transports").then(x => x.json()); list = (r && r.transports) || []; }
+        catch (e) { setStatus("Couldn't load transports: " + e.message, "error"); }
+        transportsList = list.map(t => ({ name: t.name, track: (t.currentTrack && t.currentTrack.name) || "" }));
+        rebuildBlocks();
+        reconcileLU();
+    }
+    function trackOf(name) { const t = transportsList.find(x => x.name === name); return t ? t.track : ""; }
+    function refreshAll() { loadTransports().then(pollMeta); }
+
+    function makeLU(object, properties, freq, onValue, onStatus) {
+        let ws = null, ids = [], stopped = false, timer = null;
+        function connect() {
+            try { ws = new WebSocket("ws://" + getDirector() + "/api/session/liveupdate"); }
+            catch (e) { schedule(); return; }
+            ws.onopen = () => { ids = []; ws.send(JSON.stringify({ subscribe: { object: object, properties: properties, configuration: { updateFrequencyMs: freq } } })); onStatus && onStatus(true); };
+            ws.onclose = () => { ws = null; onStatus && onStatus(false); schedule(); };
+            ws.onerror = () => {};
+            ws.onmessage = (ev) => {
+                let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+                if (m.error) { return; }
+                if (m.subscriptions) { m.subscriptions.forEach((s, i) => { ids[i] = s.id; }); return; }
+                if (m.valuesChanged) m.valuesChanged.forEach(v => { const idx = ids.indexOf(v.id); if (idx >= 0 && onValue) onValue(idx, v.value); });
+            };
+        }
+        function schedule() { if (!stopped && !timer) timer = setTimeout(() => { timer = null; connect(); }, 3000); }
+        connect();
+        return { stop() { stopped = true; if (timer) clearTimeout(timer); if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} ws = null; } } };
+    }
+    let luConns = {}, luOk = {};
+    function updateLuDot() {
+        const need = Object.keys(luConns), ok = need.length > 0 && need.every(t => luOk[t]);
+        const el = document.getElementById('lu-state'); el.className = ok ? "on" : "off"; el.title = "LiveUpdate " + (ok ? "connected" : "…");
+    }
+    function reconcileLU() {
+        const need = new Set(transportsList.map(t => t.name));
+        for (const tn in luConns) { if (!need.has(tn)) { luConns[tn].stop(); delete luConns[tn]; delete luOk[tn]; } }
+        need.forEach(tn => {
+            if (luConns[tn]) return;
+            luOk[tn] = false;
+            const props = ['object.beatToTimecode(object.track.timeToBeat(object.player.tCurrent)).__str__()', 'object.player.tCurrent'];
+            const fields = ['timeTC', 'tCurrent'];
+            luConns[tn] = makeLU("transportmanager:" + tn, props, 0,
+                (idx, val) => { (G[tn] = G[tn] || {})[fields[idx]] = val; scheduleRender(); },
+                ok => { luOk[tn] = ok; updateLuDot(); });
+        });
+        updateLuDot();
+    }
+
+    // ---------- slow poll (per-transport section/note) ----------
+    function pollScript(names) {
+        return PY_EX +
+            "names = " + JSON.stringify(names) + "\n" +
+            "o = {}\n" +
+            "for tn in names:\n" +
+            "    try:\n" +
+            "        t = _ex.evaluateFromString('transportmanager:' + tn); tr = t.track; p = t.player\n" +
+            "        tc = float(p.tCurrent); beat = tr.timeToBeat(tc)\n" +
+            "        td = {}\n" +
+            "        td['playMode'] = str(p.playMode)\n" +
+            "        try:\n" +
+            "            d2 = t.timecode; td['smpteCt'] = int(d2.SMPTE_clock_type) if d2 is not None else int(t.smpteClockType())\n" +
+            "        except BaseException: td['smpteCt'] = 5\n" +
+            "        try:\n" +
+            "            sb = tr.findBeatOfLastSection(beat); nb = tr.findBeatOfNextSection(beat)\n" +
+            "            td['secStart']=float(tr.beatToTime(sb)); td['secEnd']=float(tr.beatToTime(nb))\n" +
+            "            ns = int(tr.nSections()); idx = 0\n" +
+            "            for i in range(ns):\n" +
+            "                if abs(float(tr.sectionToBeat(i)) - float(sb)) < 0.01: idx = i; break\n" +
+            "            cn = str(tr.noteAtBeat(sb)); td['curSecName'] = cn if cn else ('Section ' + str(idx))\n" +
+            "            nn = str(tr.noteAtBeat(nb)); td['nextSecName'] = nn if nn else (('Section ' + str(idx+1)) if (idx+1) < ns else 'End')\n" +
+            "        except BaseException:\n" +
+            "            td['secStart']=None; td['secEnd']=None\n" +
+            "        try:\n" +
+            "            lnb = tr.findBeatOfLastNote(beat); lnn = str(tr.noteAtBeat(lnb))\n" +
+            "            if lnn and float(lnb) <= beat: td['lastNoteTime']=float(tr.beatToTime(lnb)); td['lastNoteName']=lnn\n" +
+            "            else: td['lastNoteTime']=None; td['lastNoteName']=''\n" +
+            "        except BaseException: td['lastNoteTime']=None; td['lastNoteName']=''\n" +
+            "        try:\n" +
+            "            nnb = tr.findBeatOfNextNote(beat); nnn = str(tr.noteAtBeat(nnb))\n" +
+            "            if nnn and float(nnb) > beat: td['nextNoteTime']=float(tr.beatToTime(nnb)); td['nextNoteName']=nnn\n" +
+            "            else: td['nextNoteTime']=None; td['nextNoteName']=''\n" +
+            "        except BaseException: td['nextNoteTime']=None; td['nextNoteName']=''\n" +
+            "        o[tn] = td\n" +
+            "    except BaseException: pass\n" +
+            "print(json.dumps({'ok': True, 'data': o}))\n";
+    }
+    let pollingMeta = false;
+    async function pollMeta() {
+        if (!transportsList.length) { setStatus("No transports.", ""); return; }
+        if (pollingMeta) return; pollingMeta = true;
+        try {
+            const out = await runScript(pollScript(transportsList.map(t => t.name)));
+            if (out && out.ok) { setStatus(""); M = { transports: out.data || {} }; scheduleRender(); }
+            else setStatus("Designer error: " + (out && out.error), "error");
+        } catch (e) { setStatus("Poll failed: " + e.message, "error"); }
+        finally { pollingMeta = false; }
+    }
+
+    // ---------- blocks ----------
+    let blocks = {};
+    function rebuildBlocks() {
+        const host = document.getElementById('blocks');
+        host.replaceChildren(); blocks = {};
+        transportsList.forEach(t => {
+            const el = document.createElement('div'); el.className = 'txblock';
+            el.innerHTML =
+                '<div class="txhead"><span class="txname"></span> <span class="txtrack dim"></span> <span class="txtime tc"></span></div>' +
+                '<div class="clockrow"><span class="rlab">SEC</span>' +
+                '<div class="ctile"><div class="cname cur sc"></div><div class="ctime ss"></div></div>' +
+                '<div class="ctile"><div class="cname nxt su"></div><div class="ctime sut"></div></div>' +
+                '<span class="count none scnt"></span></div>' +
+                '<div class="clockrow"><span class="rlab">NOTE</span>' +
+                '<div class="ctile"><div class="cname cur nc"></div><div class="ctime nsi"></div></div>' +
+                '<div class="ctile"><div class="cname nxt nu"></div><div class="ctime nut"></div></div>' +
+                '<span class="count none ncnt"></span></div>';
+            host.appendChild(el);
+            const q = s => el.querySelector(s);
+            blocks[t.name] = { name: t.name, els: { name: q('.txname'), track: q('.txtrack'), time: q('.txtime'), sc: q('.sc'), ss: q('.ss'), su: q('.su'), sut: q('.sut'), scnt: q('.scnt'), nc: q('.nc'), nsi: q('.nsi'), nu: q('.nu'), nut: q('.nut'), ncnt: q('.ncnt') } };
+            blocks[t.name].els.name.textContent = t.name;
+            blocks[t.name].els.track.textContent = t.track;
+        });
+    }
+
+    // ---------- render ----------
+    let rafPending = false;
+    function scheduleRender() { if (!rafPending) { rafPending = true; requestAnimationFrame(() => { rafPending = false; render(); }); } }
+    function setCnt(el, cd) { const c = countdown(cd); el.textContent = c.t; el.className = "count " + c.cls; }
+    function render() {
+        for (const name in blocks) {
+            const b = blocks[name], g = G[name] || {}, m = (M.transports && M.transports[name]) || {};
+            const tfps = SMPTE_MATH_FPS[m.smpteCt] || 30, tc = (typeof g.tCurrent === 'number') ? g.tCurrent : null;
+            b.els.time.textContent = g.timeTC || "—";
+            // section
+            b.els.sc.textContent = m.curSecName || "—";
+            b.els.su.textContent = m.nextSecName ? ("UNTIL " + m.nextSecName) : "—";
+            b.els.ss.textContent = (tc !== null && m.secStart != null) ? fmtTC(tc - m.secStart, tfps) : "—";
+            b.els.sut.textContent = (tc !== null && m.secEnd != null) ? fmtTC(m.secEnd - tc, tfps) : "—";
+            setCnt(b.els.scnt, (tc !== null && m.secEnd != null) ? m.secEnd - tc : null);
+            // note
+            b.els.nc.textContent = m.lastNoteName || "(no note yet)";
+            b.els.nu.textContent = m.nextNoteName ? ("UNTIL " + m.nextNoteName) : "(no next note)";
+            b.els.nsi.textContent = (tc !== null && m.lastNoteTime != null) ? fmtTC(tc - m.lastNoteTime, tfps) : "—";
+            b.els.nut.textContent = (tc !== null && m.nextNoteTime != null) ? fmtTC(m.nextNoteTime - tc, tfps) : "—";
+            setCnt(b.els.ncnt, (tc !== null && m.nextNoteTime != null) ? m.nextNoteTime - tc : null);
+        }
+    }
+
+    // ---------- init ----------
+    const POLL_MS = 1000;
+    window.addEventListener('load', async () => {
+        await loadTransports();
+        await pollMeta();
+        setInterval(pollMeta, POLL_MS);
+    });
+</script>
+</body>
+</html>
